@@ -1,0 +1,11 @@
+{
+  "name": "vm-browser-service",
+  "private": true,
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0",
+    "ws": "^8.18.0"
+  }
+}

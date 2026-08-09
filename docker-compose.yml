@@ -1,0 +1,51 @@
+# WatchParty — Docker Compose (full stack)
+# Run everything with: docker compose up -d
+
+version: "3.8"
+
+services:
+  # Next.js web app (port 3000)
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=file:./db/watchparty.db
+      - NODE_ENV=production
+    volumes:
+      - app_db:/app/db
+
+  # Socket.IO sync service (port 3003)
+  sync:
+    image: oven/bun:latest
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "3003:3003"
+    volumes:
+      - ./mini-services/sync-service:/app
+    command: bun run dev
+
+  # Virtual browser service (port 3004)
+  # Note: requires Chrome installed in the container or host
+  vm:
+    image: node:20-slim
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "3004:3004"
+    volumes:
+      - ./vm-service:/app
+    # Install Chrome + deps, then run
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y chromium &&
+        npm install &&
+        node index.js
+      "
+    environment:
+      - CHROME_PATH=/usr/bin/chromium
+
+volumes:
+  app_db:
