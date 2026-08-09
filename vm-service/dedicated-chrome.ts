@@ -22,8 +22,8 @@ const PORT = 3004;
 const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const WIDTH = 1600;
 const HEIGHT = 900;
-const FPS = 20;
-const JPEG_QUALITY = 70;
+const FPS = 24;
+const JPEG_QUALITY = 80;
 
 // ─── State ───
 let browser: Browser | null = null;
@@ -105,6 +105,7 @@ async function launchBrowser() {
           type: "jpeg",
           quality: JPEG_QUALITY,
           clip: { x: 0, y: 0, width: WIDTH, height: HEIGHT },
+          optimizeForSpeed: true,
         });
         lastFrame = frame as Buffer;
         // Broadcast to all WS clients
