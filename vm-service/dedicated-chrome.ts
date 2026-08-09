@@ -20,10 +20,10 @@ import { join } from "path";
 
 const PORT = 3004;
 const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-const WIDTH = 1280;
-const HEIGHT = 720;
-const FPS = 15;
-const JPEG_QUALITY = 65;
+const WIDTH = 1600;
+const HEIGHT = 900;
+const FPS = 20;
+const JPEG_QUALITY = 70;
 
 // ─── State ───
 let browser: Browser | null = null;

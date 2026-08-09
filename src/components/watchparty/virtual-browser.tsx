@@ -146,60 +146,114 @@ export function VirtualBrowser({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsUrl]);
 
-  // Send mouse position to VM
-  const getCoords = (e: React.MouseEvent) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    return {
-      x: Math.round((e.clientX - rect.left) * (canvas.width / rect.width)),
-      y: Math.round((e.clientY - rect.top) * (canvas.height / rect.height)),
-    };
-  };
+  // Auto-request control when VM mode loads (first user gets it)
+  useEffect(() => {
+    if (!controllerId && !controlQueue.includes(userId)) {
+      const timer = setTimeout(() => onRequestControl(), 1500);
+      return () => clearTimeout(timer);
+    }
+  }, []); // Only on mount
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 
+  // Native event listeners on canvas — bypasses React 19 synthetic event
+  // issues. These are attached via useEffect and read the latest
+  // isController/wsRef values via refs.
+  const isControllerRef = useRef(isController);
+  isControllerRef.current = isController;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const getNativeCoords = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: Math.round((e.clientX - rect.left) * (canvas.width / rect.width)),
+        y: Math.round((e.clientY - rect.top) * (canvas.height / rect.height)),
+      };
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isControllerRef.current) return;
+      const c = getNativeCoords(e);
+      if (c) {
+        const encoded = new TextEncoder().encode(JSON.stringify(c));
+        const msg = new Uint8Array(1 + encoded.length);
+        msg[0] = 2;
+        msg.set(encoded, 1);
+        wsRef.current?.send(msg);
+        // Broadcast cursor to remote users
+        const rect = canvas.getBoundingClientRect();
+        onCursorMove((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
+      }
+    };
+
+    const handleMouseDown = (e: MouseEvent) => {
+      if (!isControllerRef.current) return;
+      // Focus the canvas so keyboard events work
+      canvas.focus();
+      const c = getNativeCoords(e);
+      if (c) {
+        const payload = { ...c, button: e.button === 2 ? "right" : "left" };
+        const encoded = new TextEncoder().encode(JSON.stringify(payload));
+        const msg = new Uint8Array(1 + encoded.length);
+        msg[0] = 3;
+        msg.set(encoded, 1);
+        wsRef.current?.send(msg);
+      }
+      e.preventDefault();
+    };
+
+    const handleWheel = (e: WheelEvent) => {
+      if (!isControllerRef.current) return;
+      const payload = { deltaX: e.deltaX, deltaY: e.deltaY };
+      const encoded = new TextEncoder().encode(JSON.stringify(payload));
+      const msg = new Uint8Array(1 + encoded.length);
+      msg[0] = 4;
+      msg.set(encoded, 1);
+      wsRef.current?.send(msg);
+      e.preventDefault();
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!isControllerRef.current) return;
+      if (document.activeElement?.tagName === "INPUT") return;
+      const payload = { key: e.key };
+      const encoded = new TextEncoder().encode(JSON.stringify(payload));
+      const msg = new Uint8Array(1 + encoded.length);
+      msg[0] = 5;
+      msg.set(encoded, 1);
+      wsRef.current?.send(msg);
+      if (e.key.length === 1 || ["Backspace","Tab","Enter","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) {
+        e.preventDefault();
+      }
+    };
+
+    const handleContextMenu = (e: Event) => e.preventDefault();
+
+    canvas.addEventListener("mousemove", handleMouseMove, true);
+    canvas.addEventListener("mousedown", handleMouseDown, true);
+    canvas.addEventListener("wheel", handleWheel, true);
+    canvas.addEventListener("contextmenu", handleContextMenu, true);
+    canvas.addEventListener("keydown", handleKeyDown, true);
+
+    return () => {
+      canvas.removeEventListener("mousemove", handleMouseMove, true);
+      canvas.removeEventListener("mousedown", handleMouseDown, true);
+      canvas.removeEventListener("wheel", handleWheel, true);
+      canvas.removeEventListener("contextmenu", handleContextMenu, true);
+      canvas.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [onCursorMove]);
+
+  // Helper for navigation buttons (sends via WebSocket)
   const sendMsg = (type: number, payload: Record<string, unknown>) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        new Uint8Array([type, ...new TextEncoder().encode(JSON.stringify(payload))]),
-      );
-    }
-  };
-
-  const onMouseMove = useCallback(
-    (e: React.MouseEvent) => {
-      if (!isController) return;
-      const c = getCoords(e);
-      if (c) {
-        sendMsg(2, c);
-        // Also broadcast to remote cursors
-        const rect = canvasRef.current?.getBoundingClientRect();
-        if (rect) {
-          onCursorMove((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
-        }
-      }
-    },
-    [isController, onCursorMove],
-  );
-
-  const onMouseDown = (e: React.MouseEvent) => {
-    if (!isController) return;
-    const c = getCoords(e);
-    if (c) sendMsg(3, { ...c, button: e.button === 2 ? "right" : "left" });
-    e.preventDefault();
-  };
-
-  const onWheel = (e: React.WheelEvent) => {
-    if (!isController) return;
-    sendMsg(4, { deltaX: e.deltaX, deltaY: e.deltaY });
-    e.preventDefault();
-  };
-
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (!isController) return;
-    if (document.activeElement?.tagName === "INPUT") return;
-    sendMsg(5, { key: e.key });
-    if (e.key.length === 1 || ["Backspace", "Tab", "Enter", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
-      e.preventDefault();
+      const encoded = new TextEncoder().encode(JSON.stringify(payload));
+      const msg = new Uint8Array(1 + encoded.length);
+      msg[0] = type;
+      msg.set(encoded, 1);
+      wsRef.current.send(msg);
     }
   };
 
@@ -292,15 +346,12 @@ export function VirtualBrowser({
       </div>
 
       {/* Canvas + cursor overlay */}
-      <div ref={wrapRef} className="relative min-h-0 flex-1 bg-black" tabIndex={0} onKeyDown={onKeyDown}>
+      <div ref={wrapRef} className="relative min-h-0 flex-1 bg-black" tabIndex={0}>
         <canvas
           ref={canvasRef}
-          className="absolute inset-0 h-full w-full object-contain"
+          tabIndex={-1}
+          className="absolute inset-0 h-full w-full outline-none"
           style={{ pointerEvents: isController ? "auto" : "none", cursor: isController ? "crosshair" : "default" }}
-          onMouseMove={onMouseMove}
-          onMouseDown={onMouseDown}
-          onWheel={onWheel}
-          onContextMenu={(e) => e.preventDefault()}
         />
 
         {/* Remote cursors overlay */}
@@ -325,6 +376,11 @@ export function VirtualBrowser({
             <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-[10px] text-white/80 backdrop-blur">
               <Users className="mr-1 inline h-3 w-3" />
               {remoteCursors.find((c) => c.userId === controllerId)?.name || "Someone"} is controlling
+            </div>
+          )}
+          {isController && (
+            <div className="absolute top-2 left-1/2 -translate-x-1/2 animate-pulse rounded-full bg-violet-600 px-4 py-1 text-xs font-bold text-white shadow-lg">
+              ● YOU HAVE CONTROL — click to interact
             </div>
           )}
         </div>
@@ -353,7 +409,7 @@ export function VirtualBrowser({
           {loading ? "connecting" : "connected"}
         </span>
         <span className="text-zinc-700">·</span>
-        <span>1280×720</span>
+        <span>1600×900</span>
         {fps > 0 && (
           <>
             <span className="text-zinc-700">·</span>
