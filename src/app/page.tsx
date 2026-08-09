@@ -700,13 +700,20 @@ function RoomView({
                 </p>
 
                 {/* Sync buttons */}
-                <div className="flex gap-3">
+                <div className="flex flex-wrap gap-3">
                   <Button size="lg" className="gap-2 bg-emerald-600 hover:bg-emerald-700" onClick={startCountdown}>
                     <Play className="h-5 w-5" /> 3-2-1 Sync Start
                   </Button>
                   <Button size="lg" variant="outline" className="gap-2" onClick={syncPause}>
                     <Pause className="h-5 w-5" /> Sync Pause
                   </Button>
+                  <Button size="lg" className="gap-2 bg-violet-600 hover:bg-violet-700" onClick={() => window.open(`/api/bookmarklet?room=${roomSlug}`, "_blank")}>
+                    <Zap className="h-5 w-5" /> Get Sync Bookmarklet
+                  </Button>
+                </div>
+
+                <div className="max-w-md rounded-lg border border-violet-500/30 bg-violet-500/10 p-3 text-center text-xs text-violet-300">
+                  <strong>Best sync method:</strong> Open the movie site in your browser → click the bookmarklet → enter room code <code className="rounded bg-violet-500/20 px-1">{roomSlug}</code>. The video hooks directly — play/pause/seek all sync with &lt;100ms latency. No streaming, no lag. This is how w2g works.
                 </div>
 
                 {/* Copy room link */}
