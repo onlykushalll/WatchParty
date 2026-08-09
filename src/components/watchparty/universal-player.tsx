@@ -490,6 +490,9 @@ function YouTubePlayer({
           } else if (e.data === window.YT.PlayerState.PAUSED) {
             onIntent({ isPlaying: false, currentTime: p.getCurrentTime() });
           }
+          // BUFFERING (state 3): don't broadcast — let the periodic
+          // drift correction handle re-sync when playback resumes.
+          // The server's heartbeat will keep everyone aligned.
         },
         onError: () => setError("YouTube video could not be loaded"),
       },
@@ -562,7 +565,7 @@ function YouTubePlayer({
   );
 }
 
-/* ─────────��───────────────── Iframe portal ─────────────────────────── */
+/* ─────────────────────────── Iframe portal ─────────────────────────── */
 
 function IframePortal({ url, onError }: { url: string; onError: (e: string) => void }) {
   // Route through our /api/proxy to strip X-Frame-Options + follow redirects.

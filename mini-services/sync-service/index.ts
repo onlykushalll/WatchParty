@@ -163,6 +163,12 @@ const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingTimeout: 60000,
   pingInterval: 25000,
+  // Connection state recovery — restores client state after brief
+  // disconnections (WiFi blip, tab sleep, etc.) without re-joining.
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true,
+  },
 });
 
 io.on("connection", (socket: Socket) => {

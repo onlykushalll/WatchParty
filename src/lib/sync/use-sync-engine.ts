@@ -145,14 +145,26 @@ export function useSyncEngine({
     let sock: Socket | null = null;
 
     // Determine the sync socket URL based on where we're running.
+    // Auto-detects: if on a tunnel domain (e.g. wp.example.com), use
+    // sync.example.com. If localhost, use localhost:3003.
     const host = typeof window !== "undefined" ? window.location.hostname : "";
+    const proto = typeof window !== "undefined" ? window.location.protocol : "https:";
     let syncUrl: string;
-    if (host.endsWith("kushalneedsmcp.online")) {
-      syncUrl = "https://sync.kushalneedsmcp.online";
-    } else if (host === "localhost" || host === "127.0.0.1") {
+    if (host === "localhost" || host === "127.0.0.1") {
       syncUrl = "http://localhost:3003";
-    } else {
+    } else if (host.startsWith("preview-") || host.includes(".space-z.ai")) {
+      // Sandbox preview — use Caddy XTransformPort pattern
       syncUrl = "/?XTransformPort=3003";
+    } else {
+      // Production tunnel — derive sync subdomain from host
+      // e.g. wp.kushalneedsmcp.online → sync.kushalneedsmcp.online
+      const parts = host.split(".");
+      if (parts.length >= 3) {
+        parts[0] = "sync";
+        syncUrl = `${proto}//${parts.join(".")}`;
+      } else {
+        syncUrl = `${proto}//sync.${host}`;
+      }
     }
 
 
