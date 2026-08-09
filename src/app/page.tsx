@@ -402,7 +402,7 @@ function RoomView({
   const [urlInput, setUrlInput] = useState("");
   const [copied, setCopied] = useState(false);
   const [tab, setTab] = useState<"chat" | "queue">("chat");
-  const [mode, setMode] = useState<"video" | "external">("video");
+  const [mode, setMode] = useState<"video" | "vm" | "external">("video");
   const [countdown, setCountdown] = useState<number | null>(null);
   const [externalUrl, setExternalUrl] = useState("https://cinevo.nl/watch/movie/aashiqui-2-192558");
 
@@ -486,6 +486,14 @@ function RoomView({
             }`}
           >
             <Play className="h-3 w-3" /> Video
+          </button>
+          <button
+            onClick={() => setMode("vm")}
+            className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-semibold transition-all ${
+              mode === "vm" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <MonitorPlay className="h-3 w-3" /> Virtual PC
           </button>
           <button
             onClick={() => setMode("external")}
@@ -645,6 +653,20 @@ function RoomView({
                   hasNext={hasNext}
                 />
               </div>
+            ) : mode === "vm" ? (
+              <VirtualBrowser
+                vmUrl={typeof window !== "undefined" ? (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? "http://localhost:3004" : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "vm"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//vm.${window.location.hostname}`; })()) : "https://vm.kushalneedsmcp.online"}
+                password="watchparty"
+                userName={userName}
+                userColor={engine.you?.color || "#a78bfa"}
+                userId={userId}
+                remoteCursors={engine.remoteCursors || []}
+                controllerId={engine.vmController || null}
+                controlQueue={engine.vmControlQueue || []}
+                onCursorMove={engine.sendVmCursor}
+                onRequestControl={engine.requestVmControl}
+                onReleaseControl={engine.releaseVmControl}
+              />
             ) : (
               /* Watch Together mode — open external site + sync buttons */
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-zinc-950 p-8">

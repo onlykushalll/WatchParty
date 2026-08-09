@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Loader2,
   Maximize,
@@ -51,11 +52,16 @@ export function VirtualBrowser({
   const [fullscreen, setFullscreen] = useState(false);
   const [fps, setFps] = useState(0);
   const [urlBar, setUrlBar] = useState("");
+  const [hasControl, setHasControl] = useState(false);
 
   const isController = controllerId === userId;
   const wsUrl = vmUrl.replace(/^http/, "ws") + "/ws";
 
-  // Connect to the VM Chrome service via WebSocket
+  // Track control state in ref for event handlers
+  const isControllerRef = useRef(isController);
+  isControllerRef.current = isController;
+
+  // WebSocket connection
   useEffect(() => {
     let cancelled = false;
     let frameCount = 0;
@@ -75,9 +81,8 @@ export function VirtualBrowser({
     ws.onmessage = (e) => {
       if (cancelled) return;
       const data = new Uint8Array(e.data as ArrayBuffer);
-      const type = data[0];
-      if (type === 1) {
-        // JPEG frame
+      if (data[0] === 1) {
+        // JPEG frame from CDP screencast
         const canvas = canvasRef.current;
         if (!canvas) return;
         const ctx = canvas.getContext("2d", { alpha: false });
@@ -92,7 +97,6 @@ export function VirtualBrowser({
           ctx.drawImage(img, 0, 0);
           URL.revokeObjectURL(url);
 
-          // FPS counter
           frameCount++;
           const now = Date.now();
           if (now - lastFpsTime > 1000) {
@@ -102,15 +106,6 @@ export function VirtualBrowser({
           }
         };
         img.src = url;
-      } else if (type === 12) {
-        // CDP frame navigation push event from VM service
-        try {
-          const payloadStr = new TextDecoder().decode(data.slice(1));
-          const payload = JSON.parse(payloadStr);
-          if (payload.url) {
-            setUrlBar(payload.url);
-          }
-        } catch (err) {}
       }
     };
 
@@ -125,46 +120,38 @@ export function VirtualBrowser({
       if (!cancelled) {
         setLoading(true);
         setError(null);
-        // Auto-reconnect after 2s
-        setTimeout(() => {
-          if (!cancelled) {
-            wsRef.current = null;
-          }
-        }, 2000);
       }
     };
 
+    // URL bar polling
+    const urlInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        fetch(`${vmUrl}/url`)
+          .then((r) => r.json())
+          .then((d) => { if (d.url && d.url !== urlBar) setUrlBar(d.url); })
+          .catch(() => {});
+      }
+    }, 3000);
+
     return () => {
       cancelled = true;
+      clearInterval(urlInterval);
       ws.close();
       wsRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsUrl]);
 
-  // Auto-request control when VM mode loads (first user gets it)
+  // Auto-request control
   useEffect(() => {
     if (!controllerId && !controlQueue.includes(userId)) {
-      const timer = setTimeout(() => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          const payload = new TextEncoder().encode(JSON.stringify({ userId, userName }));
-          const msg = new Uint8Array(1 + payload.length);
-          msg[0] = 16;
-          msg.set(payload, 1);
-          wsRef.current.send(msg);
-        }
-        onRequestControl();
-      }, 1500);
+      const timer = setTimeout(() => onRequestControl(), 1500);
       return () => clearTimeout(timer);
     }
-  }, [controllerId, controlQueue, userId, userName, onRequestControl]);
+  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 
-  // Native event listeners on canvas — bypasses React 19 synthetic event
-  // issues. These are attached via useEffect and read the latest
-  // isController/wsRef values via refs.
-  const isControllerRef = useRef(isController);
-  isControllerRef.current = isController;
-
-  // Helper for navigation buttons (sends via WebSocket)
+  // Helper to send WS messages
   const sendMsg = (type: number, payload: Record<string, unknown>) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       const encoded = new TextEncoder().encode(JSON.stringify(payload));
@@ -175,38 +162,31 @@ export function VirtualBrowser({
     }
   };
 
-  const handleRequestControl = useCallback(() => {
-    sendMsg(16, { userId, userName });
-    onRequestControl();
-  }, [userId, userName, onRequestControl]);
-
-  const handleReleaseControl = useCallback(() => {
-    sendMsg(17, { userId });
-    onReleaseControl();
-  }, [userId, onReleaseControl]);
-
+  // Normalized coordinates (0.0 to 1.0) — as specified in the research report
   const getNormalizedCoords = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
-    if (!canvas) return { xNorm: 0, yNorm: 0 };
+    if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return { xNorm: 0, yNorm: 0 };
-    const xNorm = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const yNorm = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-    return { xNorm, yNorm };
+    return {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height,
+    };
   };
 
-  // Mouse handlers — directly on canvas via React props
+  // Mouse handlers — use NORMALIZED coordinates
   const handleMouseMove = (e: React.MouseEvent) => {
     if (!isControllerRef.current) return;
-    const { xNorm, yNorm } = getNormalizedCoords(e);
-    sendMsg(2, { xNorm, yNorm });
-    onCursorMove(xNorm, yNorm);
+    const c = getNormalizedCoords(e);
+    if (c) {
+      sendMsg(2, c); // type 2 = mouseMove (normalized)
+      onCursorMove(c.x, c.y);
+    }
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
     if (!isControllerRef.current) return;
-    const { xNorm, yNorm } = getNormalizedCoords(e);
-    sendMsg(3, { xNorm, yNorm, button: e.button === 2 ? "right" : "left" });
+    const c = getNormalizedCoords(e);
+    if (c) sendMsg(3, { ...c, button: e.button === 2 ? "right" : "left" });
     e.preventDefault();
   };
 
@@ -216,20 +196,21 @@ export function VirtualBrowser({
     e.preventDefault();
   };
 
-  // Keyboard handler — global window listener when controller
+  // Keyboard — global window listener when controller
   useEffect(() => {
     if (!isController) return;
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
-      
+
       if (e.key.length === 1) {
-        const script = `(function(){var el=document.activeElement;if(el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable)){if(el.isContentEditable){document.execCommand('insertText',false,${JSON.stringify(e.key)})}else{el.value+=(${JSON.stringify(e.key)});el.dispatchEvent(new Event('input',{bubbles:true}))}}})()`;
-        sendMsg(11, { script });
+        // Single character → use type 6 (char input via CDP)
+        sendMsg(6, { text: e.key });
       } else {
+        // Special key → use type 5 (keyDown/keyUp via CDP)
         sendMsg(5, { key: e.key });
       }
-      
+
       if (e.key.length === 1 || ["Backspace","Tab","Enter","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) {
         e.preventDefault();
         e.stopPropagation();
@@ -240,22 +221,14 @@ export function VirtualBrowser({
   }, [isController]);
 
   const navigate = (url: string) => {
-    url = (url || "").trim();
+    url = url.trim();
     if (!url) return;
-    const lower = url.toLowerCase();
-    const forbiddenSchemes = ["file:", "chrome:", "chrome-extension:", "javascript:", "data:", "about:"];
-    if (forbiddenSchemes.some((scheme) => lower.startsWith(scheme))) {
-      return;
-    }
-    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
+    if (!url.match(/^https?:\/\//)) url = "https://" + url;
     setUrlBar(url);
     sendMsg(7, { url });
   };
 
-  const goBack = () => sendMsg(8, {});
-  const goFwd = () => sendMsg(9, {});
-  const reload = () => sendMsg(10, {});
-  const goHome = () => navigate("https://www.google.com");
+  const queuePosition = (controlQueue || []).indexOf(userId || "");
 
   const toggleFullscreen = () => {
     const el = wrapRef.current;
@@ -270,22 +243,20 @@ export function VirtualBrowser({
     return () => document.removeEventListener("fullscreenchange", onFs);
   }, []);
 
-  const queuePosition = (controlQueue || []).indexOf(userId || "");
-
   return (
-    <div className="relative flex h-full w-full flex-col bg-black">
+    <div className="flex h-full w-full flex-col bg-black">
       {/* Toolbar */}
       <div className="flex shrink-0 items-center gap-1 border-b border-zinc-800 bg-zinc-900 px-2 py-1.5">
         <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-500" />
         {isController ? (
           <>
-            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={goBack}>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={() => sendMsg(8, {})}>
               <ArrowLeft className="h-3.5 w-3.5" />
             </Button>
-            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={goFwd}>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={() => sendMsg(9, {})}>
               <ArrowRight className="h-3.5 w-3.5" />
             </Button>
-            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={reload}>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={() => sendMsg(10, {})}>
               <RotateCw className="h-3.5 w-3.5" />
             </Button>
             <input
@@ -296,7 +267,7 @@ export function VirtualBrowser({
               className="flex-1 rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-violet-500"
               spellCheck={false}
             />
-            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={goHome}>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={() => navigate("https://www.google.com")}>
               <Home className="h-3.5 w-3.5" />
             </Button>
           </>
@@ -306,9 +277,8 @@ export function VirtualBrowser({
           </span>
         )}
 
-        {/* Control button */}
         {isController ? (
-          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={handleReleaseControl}>
+          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={onReleaseControl}>
             <Unlock className="h-3 w-3" /> Release
           </Button>
         ) : controllerId ? (
@@ -317,12 +287,12 @@ export function VirtualBrowser({
               <Hand className="h-3 w-3" /> Queue #{queuePosition + 1}
             </span>
           ) : (
-            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={handleRequestControl}>
+            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
               <Hand className="h-3 w-3" /> Request
             </Button>
           )
         ) : (
-          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={handleRequestControl}>
+          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
             <Lock className="h-3 w-3" /> Take control
           </Button>
         )}
@@ -333,7 +303,7 @@ export function VirtualBrowser({
       </div>
 
       {/* Canvas + cursor overlay */}
-      <div ref={wrapRef} className="relative min-h-0 flex-1 bg-black" tabIndex={0}>
+      <div ref={wrapRef} className="relative min-h-0 flex-1 bg-black">
         <canvas
           ref={canvasRef}
           tabIndex={-1}
@@ -345,38 +315,32 @@ export function VirtualBrowser({
           onContextMenu={(e) => e.preventDefault()}
         />
 
-        {/* Remote cursors overlay */}
+        {/* Remote cursors */}
         <div className="pointer-events-none absolute inset-0 z-10">
-          {remoteCursors
-            .filter((c) => c.userId !== userId)
-            .map((c) => (
-              <div
-                key={c.userId}
-                className="absolute transition-all duration-75"
-                style={{ left: `${c.x * 100}%`, top: `${c.y * 100}%`, transform: "translate(-2px,-2px)" }}
-              >
-                <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                  <path d="M3 2L3 16L7 12L10 18L12 17L9 11L15 11L3 2Z" fill={c.color} stroke="white" strokeWidth="1.5" strokeLinejoin="round" />
-                </svg>
-                <span className="ml-1 rounded-full px-1.5 py-0.5 text-[9px] font-bold text-white" style={{ backgroundColor: c.color }}>
-                  {c.name.slice(0, 8)}
-                </span>
-              </div>
-            ))}
+          {remoteCursors.filter((c) => c.userId !== userId).map((c) => (
+            <div key={c.userId} className="absolute transition-all duration-75" style={{ left: `${c.x * 100}%`, top: `${c.y * 100}%`, transform: "translate(-2px,-2px)" }}>
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                <path d="M3 2L3 16L7 12L10 18L12 17L9 11L15 11L3 2Z" fill={c.color} stroke="white" strokeWidth="1.5" strokeLinejoin="round" />
+              </svg>
+              <span className="ml-1 rounded-full px-1.5 py-0.5 text-[9px] font-bold text-white" style={{ backgroundColor: c.color }}>
+                {c.name.slice(0, 8)}
+              </span>
+            </div>
+          ))}
+          {isController && (
+            <div className="absolute top-2 left-1/2 -translate-x-1/2 animate-pulse rounded-full bg-violet-600 px-4 py-1 text-xs font-bold text-white shadow-lg">
+              ● YOU HAVE CONTROL
+            </div>
+          )}
           {controllerId && controllerId !== userId && (
             <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-[10px] text-white/80 backdrop-blur">
               <Users className="mr-1 inline h-3 w-3" />
               {remoteCursors.find((c) => c.userId === controllerId)?.name || "Someone"} is controlling
             </div>
           )}
-          {isController && (
-            <div className="absolute top-2 left-1/2 -translate-x-1/2 animate-pulse rounded-full bg-violet-600 px-4 py-1 text-xs font-bold text-white shadow-lg">
-              ● YOU HAVE CONTROL — click to interact
-            </div>
-          )}
         </div>
 
-        {/* Loading overlay */}
+        {/* Loading */}
         {loading && !error && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-zinc-900">
             <Loader2 className="h-8 w-8 animate-spin text-violet-400" />
@@ -384,11 +348,11 @@ export function VirtualBrowser({
           </div>
         )}
 
-        {/* Error overlay */}
+        {/* Error */}
         {error && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-zinc-900 p-6 text-center">
             <p className="text-sm font-medium text-rose-400">{error}</p>
-            <p className="text-xs text-zinc-500">VM service at {vmUrl}</p>
+            <p className="text-xs text-zinc-500">{vmUrl}</p>
           </div>
         )}
       </div>
@@ -400,19 +364,9 @@ export function VirtualBrowser({
           {loading ? "connecting" : "connected"}
         </span>
         <span className="text-zinc-700">·</span>
-        <span>1600×900</span>
-        {fps > 0 && (
-          <>
-            <span className="text-zinc-700">·</span>
-            <span>{fps}fps</span>
-          </>
-        )}
-        {isController && (
-          <>
-            <span className="text-zinc-700">·</span>
-            <span className="text-violet-400">● you control</span>
-          </>
-        )}
+        <span>1280×720</span>
+        {fps > 0 && (<><span className="text-zinc-700">·</span><span>{fps}fps</span></>)}
+        {isController && (<><span className="text-zinc-700">·</span><span className="text-violet-400">● you control</span></>)}
         <span className="ml-auto">{remoteCursors.length + 1} online</span>
       </div>
     </div>
