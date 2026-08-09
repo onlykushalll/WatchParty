@@ -217,32 +217,57 @@ export function VirtualBrowser({
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!isControllerRef.current) return;
-      if (document.activeElement?.tagName === "INPUT") return;
-      const payload = { key: e.key };
-      const encoded = new TextEncoder().encode(JSON.stringify(payload));
-      const msg = new Uint8Array(1 + encoded.length);
-      msg[0] = 5;
-      msg.set(encoded, 1);
-      wsRef.current?.send(msg);
-      if (e.key.length === 1 || ["Backspace","Tab","Enter","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) {
+      // Don't capture keys when user is typing in our own URL bar
+      const target = e.target as HTMLElement;
+      if (target?.tagName === "INPUT" && target?.id !== "vm-canvas") return;
+
+      // For single characters, use page.evaluate to directly set the value
+      // of the focused element — Puppeteer's keyboard.type() doesn't work
+      // reliably on many sites (Google, etc.) that ignore synthetic events.
+      if (e.key.length === 1) {
+        // Use type 11 (evaluate) to type the character into the focused element
+        const script = `(function(){var el=document.activeElement;if(el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable)){if(el.isContentEditable){document.execCommand('insertText',false,'${e.key}')}else{el.value+=('${e.key}');el.dispatchEvent(new Event('input',{bubbles:true}))}}})()`;
+        const encoded = new TextEncoder().encode(JSON.stringify({ script }));
+        const msg = new Uint8Array(1 + encoded.length);
+        msg[0] = 11;
+        msg.set(encoded, 1);
+        wsRef.current?.send(msg);
+      } else {
+        // Special keys (Enter, Backspace, arrows, etc.) — use keyboard.press
+        const payload = { key: e.key };
+        const encoded = new TextEncoder().encode(JSON.stringify(payload));
+        const msg = new Uint8Array(1 + encoded.length);
+        msg[0] = 5;
+        msg.set(encoded, 1);
+        wsRef.current?.send(msg);
+      }
+
+      // Prevent default for most keys
+      if (e.key.length === 1 || ["Backspace","Tab","Enter","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) {
         e.preventDefault();
+        e.stopPropagation();
       }
     };
 
     const handleContextMenu = (e: Event) => e.preventDefault();
 
+    // Mouse events on canvas (capture phase)
     canvas.addEventListener("mousemove", handleMouseMove, true);
     canvas.addEventListener("mousedown", handleMouseDown, true);
     canvas.addEventListener("wheel", handleWheel, true);
     canvas.addEventListener("contextmenu", handleContextMenu, true);
-    canvas.addEventListener("keydown", handleKeyDown, true);
+
+    // Keyboard events on WINDOW (not canvas) — canvas can't hold focus
+    // reliably, so we capture ALL keydown globally when user has control.
+    // The handleKeyDown checks isControllerRef + skips our own inputs.
+    window.addEventListener("keydown", handleKeyDown, true);
 
     return () => {
       canvas.removeEventListener("mousemove", handleMouseMove, true);
       canvas.removeEventListener("mousedown", handleMouseDown, true);
       canvas.removeEventListener("wheel", handleWheel, true);
       canvas.removeEventListener("contextmenu", handleContextMenu, true);
-      canvas.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("keydown", handleKeyDown, true);
     };
   }, [onCursorMove]);
 

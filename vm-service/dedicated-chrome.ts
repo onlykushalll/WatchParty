@@ -197,7 +197,15 @@ wss.on("connection", (ws: WebSocket) => {
         await page.mouse.wheel({ deltaX, deltaY });
       } else if (type === 5) { // Key press
         const { key } = JSON.parse(payload);
-        await page.keyboard.press(key);
+        console.log("[vm] key received:", key, "page exists:", !!page);
+        // For single characters, use type() which sends keydown+keypress+input+keyup
+        if (key.length === 1) {
+          await page.keyboard.type(key);
+          console.log("[vm] typed:", key);
+        } else {
+          await page.keyboard.press(key);
+          console.log("[vm] pressed:", key);
+        }
       } else if (type === 6) { // Type text
         const { text } = JSON.parse(payload);
         await page.keyboard.type(text);
@@ -207,6 +215,10 @@ wss.on("connection", (ws: WebSocket) => {
       } else if (type === 8) { await page.goBack(); }
       else if (type === 9) { await page.goForward(); }
       else if (type === 10) { await page.reload(); }
+      else if (type === 11) { // Evaluate JS on page
+        const { script } = JSON.parse(payload);
+        await page.evaluate(script).catch((e: Error) => console.log("[vm] eval error:", e.message));
+      }
     } catch (e) {}
   });
 
