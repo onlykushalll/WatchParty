@@ -52,6 +52,8 @@ interface RoomState {
   queue: { url: string; type: string; addedBy: string; addedAt: number }[];
   currentIndex: number;
   lastActivity: number;
+  vmController: string | null; // userId of current VM controller
+  vmControlQueue: string[]; // userIds waiting for control
 }
 
 // ─────────────────────────── State ───────────────────────────
@@ -89,6 +91,8 @@ function ensureRoom(roomId: string): RoomState {
       queue: [],
       currentIndex: -1,
       lastActivity: Date.now(),
+      vmController: null,
+      vmControlQueue: [],
     };
     rooms.set(roomId, r);
   }
@@ -442,6 +446,65 @@ io.on("connection", (socket: Socket) => {
       r.currentIndex--;
     }
     broadcastQueue(io, r);
+  });
+
+  // ── VM cursor + control events ──
+  socket.on("vm:cursor", (payload: { x: number; y: number }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    // Broadcast cursor position to everyone EXCEPT sender
+    socket.to(currentRoomId).emit("vm:cursor", {
+      userId: me.userId,
+      name: me.name,
+      color: me.color,
+      x: payload.x,
+      y: payload.y,
+    });
+  });
+
+  socket.on("vm:control:request", () => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    if (!r.vmController) {
+      // Grant immediately if no one has control
+      r.vmController = me.userId;
+      r.vmControlQueue = r.vmControlQueue.filter((id) => id !== me.userId);
+      io.to(currentRoomId).emit("vm:control:granted", { userId: me.userId });
+      io.to(currentRoomId).emit("vm:control:state", {
+        controllerId: r.vmController,
+        queue: r.vmControlQueue,
+      });
+    } else if (!r.vmControlQueue.includes(me.userId)) {
+      // Add to queue
+      r.vmControlQueue.push(me.userId);
+      io.to(currentRoomId).emit("vm:control:state", {
+        controllerId: r.vmController,
+        queue: r.vmControlQueue,
+      });
+    }
+  });
+
+  socket.on("vm:control:release", () => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    if (r.vmController === me.userId) {
+      // Grant to next in queue
+      r.vmController = r.vmControlQueue.shift() || null;
+      io.to(currentRoomId).emit("vm:control:granted", { userId: r.vmController });
+      io.to(currentRoomId).emit("vm:control:state", {
+        controllerId: r.vmController,
+        queue: r.vmControlQueue,
+      });
+    }
   });
 
   // ── Disconnect ──

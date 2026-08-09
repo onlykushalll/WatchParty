@@ -58,6 +58,14 @@ export interface UseSyncEngineArgs {
   userName: string;
 }
 
+export interface RemoteCursor {
+  userId: string;
+  name: string;
+  color: string;
+  x: number;
+  y: number;
+}
+
 export interface SyncEngine {
   stats: SyncStats;
   playback: PlaybackState | null;
@@ -67,6 +75,13 @@ export interface SyncEngine {
   messages: ChatMessage[];
   reactions: Reaction[];
   you: Participant | null;
+  // VM cursor + control
+  remoteCursors: RemoteCursor[];
+  vmController: string | null;
+  vmControlQueue: string[];
+  sendVmCursor: (x: number, y: number) => void;
+  requestVmControl: () => void;
+  releaseVmControl: () => void;
   // Actions
   sendIntent: (patch: Partial<{
     isPlaying: boolean;
@@ -114,6 +129,9 @@ export function useSyncEngine({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [you, setYou] = useState<Participant | null>(null);
+  const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
+  const [vmController, setVmController] = useState<string | null>(null);
+  const [vmControlQueue, setVmControlQueue] = useState<string[]>([]);
 
   // ── Clock sync (Cristian's algorithm) ──
   const runClockSync = useCallback((sock: Socket) => {
@@ -234,6 +252,27 @@ export function useSyncEngine({
           setReactions((prev) => prev.filter((x) => x !== r));
         }, 4000);
       });
+
+      // ── VM cursor + control ──
+      sock.on("vm:cursor", (c: RemoteCursor) => {
+        setRemoteCursors((prev) => {
+          const filtered = prev.filter((p) => p.userId !== c.userId);
+          return [...filtered, c];
+        });
+        // Expire cursor after 5s of no movement
+        setTimeout(() => {
+          setRemoteCursors((prev) => prev.filter((p) => p !== c));
+        }, 5000);
+      });
+
+      sock.on("vm:control:state", (s: { controllerId: string | null; queue: string[] }) => {
+        setVmController(s.controllerId);
+        setVmControlQueue(s.queue);
+      });
+
+      sock.on("vm:control:granted", (s: { userId: string | null }) => {
+        setVmController(s.userId);
+      });
     }).catch((err) => {
       console.error("[sync] failed to load socket.io:", err.message);
     });
@@ -289,6 +328,18 @@ export function useSyncEngine({
     socketRef.current?.emit("queue:remove", { index });
   }, []);
 
+  const sendVmCursor = useCallback((x: number, y: number) => {
+    socketRef.current?.emit("vm:cursor", { x, y });
+  }, []);
+
+  const requestVmControl = useCallback(() => {
+    socketRef.current?.emit("vm:control:request", {});
+  }, []);
+
+  const releaseVmControl = useCallback(() => {
+    socketRef.current?.emit("vm:control:release", {});
+  }, []);
+
   return {
     stats,
     playback,
@@ -298,6 +349,12 @@ export function useSyncEngine({
     messages,
     reactions,
     you,
+    remoteCursors,
+    vmController,
+    vmControlQueue,
+    sendVmCursor,
+    requestVmControl,
+    releaseVmControl,
     sendIntent,
     sendChat,
     sendReaction,

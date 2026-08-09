@@ -568,6 +568,14 @@ function RoomView({
                 vmUrl="https://vm.kushalneedsmcp.online"
                 password="watchparty"
                 userName={userName}
+                userColor={engine.you?.color || "#a78bfa"}
+                userId={userId}
+                remoteCursors={engine.remoteCursors || []}
+                controllerId={engine.vmController || null}
+                controlQueue={engine.vmControlQueue || []}
+                onCursorMove={engine.sendVmCursor}
+                onRequestControl={engine.requestVmControl}
+                onReleaseControl={engine.releaseVmControl}
               />
             )}
           </div>
