@@ -161,116 +161,6 @@ export function VirtualBrowser({
   const isControllerRef = useRef(isController);
   isControllerRef.current = isController;
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const getNativeCoords = (e: MouseEvent) => {
-      const rect = canvas.getBoundingClientRect();
-      return {
-        x: Math.round((e.clientX - rect.left) * (canvas.width / rect.width)),
-        y: Math.round((e.clientY - rect.top) * (canvas.height / rect.height)),
-      };
-    };
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isControllerRef.current) return;
-      const c = getNativeCoords(e);
-      if (c) {
-        const encoded = new TextEncoder().encode(JSON.stringify(c));
-        const msg = new Uint8Array(1 + encoded.length);
-        msg[0] = 2;
-        msg.set(encoded, 1);
-        wsRef.current?.send(msg);
-        // Broadcast cursor to remote users
-        const rect = canvas.getBoundingClientRect();
-        onCursorMove((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
-      }
-    };
-
-    const handleMouseDown = (e: MouseEvent) => {
-      if (!isControllerRef.current) return;
-      // Focus the canvas so keyboard events work
-      canvas.focus();
-      const c = getNativeCoords(e);
-      if (c) {
-        const payload = { ...c, button: e.button === 2 ? "right" : "left" };
-        const encoded = new TextEncoder().encode(JSON.stringify(payload));
-        const msg = new Uint8Array(1 + encoded.length);
-        msg[0] = 3;
-        msg.set(encoded, 1);
-        wsRef.current?.send(msg);
-      }
-      e.preventDefault();
-    };
-
-    const handleWheel = (e: WheelEvent) => {
-      if (!isControllerRef.current) return;
-      const payload = { deltaX: e.deltaX, deltaY: e.deltaY };
-      const encoded = new TextEncoder().encode(JSON.stringify(payload));
-      const msg = new Uint8Array(1 + encoded.length);
-      msg[0] = 4;
-      msg.set(encoded, 1);
-      wsRef.current?.send(msg);
-      e.preventDefault();
-    };
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!isControllerRef.current) return;
-      // Don't capture keys when user is typing in our own URL bar
-      const target = e.target as HTMLElement;
-      if (target?.tagName === "INPUT" && target?.id !== "vm-canvas") return;
-
-      // For single characters, use page.evaluate to directly set the value
-      // of the focused element — Puppeteer's keyboard.type() doesn't work
-      // reliably on many sites (Google, etc.) that ignore synthetic events.
-      if (e.key.length === 1) {
-        // Use type 11 (evaluate) to type the character into the focused element
-        const script = `(function(){var el=document.activeElement;if(el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable)){if(el.isContentEditable){document.execCommand('insertText',false,'${e.key}')}else{el.value+=('${e.key}');el.dispatchEvent(new Event('input',{bubbles:true}))}}})()`;
-        const encoded = new TextEncoder().encode(JSON.stringify({ script }));
-        const msg = new Uint8Array(1 + encoded.length);
-        msg[0] = 11;
-        msg.set(encoded, 1);
-        wsRef.current?.send(msg);
-      } else {
-        // Special keys (Enter, Backspace, arrows, etc.) — use keyboard.press
-        const payload = { key: e.key };
-        const encoded = new TextEncoder().encode(JSON.stringify(payload));
-        const msg = new Uint8Array(1 + encoded.length);
-        msg[0] = 5;
-        msg.set(encoded, 1);
-        wsRef.current?.send(msg);
-      }
-
-      // Prevent default for most keys
-      if (e.key.length === 1 || ["Backspace","Tab","Enter","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) {
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    };
-
-    const handleContextMenu = (e: Event) => e.preventDefault();
-
-    // Mouse events on canvas (capture phase)
-    canvas.addEventListener("mousemove", handleMouseMove, true);
-    canvas.addEventListener("mousedown", handleMouseDown, true);
-    canvas.addEventListener("wheel", handleWheel, true);
-    canvas.addEventListener("contextmenu", handleContextMenu, true);
-
-    // Keyboard events on WINDOW (not canvas) — canvas can't hold focus
-    // reliably, so we capture ALL keydown globally when user has control.
-    // The handleKeyDown checks isControllerRef + skips our own inputs.
-    window.addEventListener("keydown", handleKeyDown, true);
-
-    return () => {
-      canvas.removeEventListener("mousemove", handleMouseMove, true);
-      canvas.removeEventListener("mousedown", handleMouseDown, true);
-      canvas.removeEventListener("wheel", handleWheel, true);
-      canvas.removeEventListener("contextmenu", handleContextMenu, true);
-      window.removeEventListener("keydown", handleKeyDown, true);
-    };
-  }, [onCursorMove]);
-
   // Helper for navigation buttons (sends via WebSocket)
   const sendMsg = (type: number, payload: Record<string, unknown>) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -281,6 +171,58 @@ export function VirtualBrowser({
       wsRef.current.send(msg);
     }
   };
+
+  // Mouse handlers — directly on canvas via React props
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isControllerRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+    const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+    sendMsg(2, { x, y });
+    onCursorMove((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (!isControllerRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
+    const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
+    sendMsg(3, { x, y, button: e.button === 2 ? "right" : "left" });
+    e.preventDefault();
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    if (!isControllerRef.current) return;
+    sendMsg(4, { deltaX: e.deltaX, deltaY: e.deltaY });
+    e.preventDefault();
+  };
+
+  // Keyboard handler — global window listener when controller
+  useEffect(() => {
+    if (!isController) return;
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
+      
+      if (e.key.length === 1) {
+        const script = `(function(){var el=document.activeElement;if(el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable)){if(el.isContentEditable){document.execCommand('insertText',false,${JSON.stringify(e.key)})}else{el.value+=(${JSON.stringify(e.key)});el.dispatchEvent(new Event('input',{bubbles:true}))}}})()`;
+        sendMsg(11, { script });
+      } else {
+        sendMsg(5, { key: e.key });
+      }
+      
+      if (e.key.length === 1 || ["Backspace","Tab","Enter","Escape","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [isController]);
 
   const navigate = (url: string) => {
     url = url.trim();
@@ -377,6 +319,10 @@ export function VirtualBrowser({
           tabIndex={-1}
           className="absolute inset-0 h-full w-full outline-none"
           style={{ pointerEvents: isController ? "auto" : "none", cursor: isController ? "crosshair" : "default" }}
+          onMouseMove={handleMouseMove}
+          onMouseDown={handleMouseDown}
+          onWheel={handleWheel}
+          onContextMenu={(e) => e.preventDefault()}
         />
 
         {/* Remote cursors overlay */}
