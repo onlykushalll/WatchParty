@@ -16,7 +16,9 @@ import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 
-const PORT = 3004;
+const PORT = Number(process.env.PORT || process.env.VM_PORT || 3004);
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:3000";
 const DEFAULT_CHROME_PATH =
   process.platform === "win32"
     ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
@@ -320,7 +322,7 @@ async function launchBrowser() {
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
   if (url.pathname === "/health") {

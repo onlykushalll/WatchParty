@@ -1,0 +1,66 @@
+# Render.com Declarative Blueprint Specification for WatchParty
+# Deploy all 3 microservices on Render.com free tier (512MB RAM)
+
+services:
+  # 1. Next.js Web Application Frontend & API
+  - type: web
+    name: watchparty-web
+    runtime: docker
+    dockerfilePath: Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: PUBLIC_URL
+        sync: false
+      - key: DATABASE_URL
+        value: file:./db/watchparty.db
+      - key: NEXT_PUBLIC_SYNC_SERVICE_URL
+        sync: false
+      - key: NEXT_PUBLIC_VM_SERVICE_URL
+        sync: false
+
+  # 2. Socket.IO State Synchronization Service
+  - type: web
+    name: watchparty-sync
+    runtime: docker
+    dockerContext: ./mini-services/sync-service
+    dockerfilePath: ./mini-services/sync-service/Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: PORT
+        value: 3003
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: PUBLIC_URL
+        sync: false
+
+  # 3. Virtual Browser / Headless Chromium Streaming Service
+  - type: web
+    name: watchparty-vm
+    runtime: docker
+    dockerContext: ./vm-service
+    dockerfilePath: ./vm-service/Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 3004
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: PUBLIC_URL
+        sync: false
+      - key: CHROME_PATH
+        value: /usr/bin/chromium
+      - key: HEADLESS
+        value: "true"
+      - key: CHROMIUM_FLAGS
+        value: '--disable-dev-shm-usage --no-sandbox --disable-gpu --renderer-process-limit=2 --js-flags="--max-old-space-size=512"'
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=512"

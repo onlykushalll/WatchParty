@@ -17,7 +17,9 @@
 import { createServer } from "http";
 import { Server, Socket } from "socket.io";
 
-const PORT = 3003;
+const PORT = Number(process.env.PORT || process.env.SYNC_PORT || 3003);
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:3000";
 const HEARTBEAT_MS = 5000;
 const ROOM_EXPIRY_MS = 6 * 60 * 60 * 1000; // 6h after last person leaves
 
@@ -32,6 +34,9 @@ interface Participant {
   joinedAt: number;
   clockOffset: number; // client time - server time (ms), maintained by clock sync
   rtt: number;
+  isMicMuted?: boolean;
+  isCameraOn?: boolean;
+  cameraPrivacyMode?: 'blackout' | 'blur' | 'avatar';
 }
 
 interface PlaybackState {
@@ -106,6 +111,9 @@ function publicParticipants(r: RoomState) {
     color: p.color,
     isHost: p.isHost,
     joinedAt: p.joinedAt,
+    isMicMuted: p.isMicMuted ?? true,
+    isCameraOn: p.isCameraOn ?? false,
+    cameraPrivacyMode: p.cameraPrivacyMode ?? "avatar",
   }));
 }
 
@@ -214,6 +222,9 @@ io.on("connection", (socket: Socket) => {
         joinedAt: Date.now(),
         clockOffset: 0,
         rtt: 0,
+        isMicMuted: true,
+        isCameraOn: false,
+        cameraPrivacyMode: "avatar",
       };
       r.participants.set(socket.id, participant);
       r.lastActivity = Date.now();
@@ -519,6 +530,28 @@ io.on("connection", (socket: Socket) => {
       });
     }
   });
+
+  socket.on(
+    "media:state",
+    (payload: {
+      isMicMuted?: boolean;
+      isCameraOn?: boolean;
+      cameraPrivacyMode?: "blackout" | "blur" | "avatar";
+    }) => {
+      if (!currentRoomId) return;
+      const r = rooms.get(currentRoomId);
+      if (!r) return;
+      const me = r.participants.get(socket.id);
+      if (!me) return;
+
+      if (payload.isMicMuted !== undefined) me.isMicMuted = payload.isMicMuted;
+      if (payload.isCameraOn !== undefined) me.isCameraOn = payload.isCameraOn;
+      if (payload.cameraPrivacyMode !== undefined)
+        me.cameraPrivacyMode = payload.cameraPrivacyMode;
+
+      broadcastPresence(io, r);
+    },
+  );
 
   // ── Disconnect ──
   socket.on("disconnect", () => {

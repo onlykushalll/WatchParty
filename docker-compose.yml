@@ -1,8 +1,6 @@
 # WatchParty — Docker Compose (full stack)
 # Run everything with: docker compose up -d
 
-version: "3.8"
-
 services:
   # Next.js web app (port 3000)
   app:
@@ -11,41 +9,59 @@ services:
     ports:
       - "3000:3000"
     environment:
+      - PORT=3000
+      - CORS_ORIGIN=*
+      - PUBLIC_URL=http://localhost:3000
       - DATABASE_URL=file:./db/watchparty.db
+      - NEXT_PUBLIC_SYNC_SERVICE_URL=http://localhost:3003
+      - NEXT_PUBLIC_VM_SERVICE_URL=ws://localhost:3004
       - NODE_ENV=production
     volumes:
       - app_db:/app/db
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'require(\"http\").get(\"http://localhost:3000/\", (res) => process.exit(res.statusCode < 500 ? 0 : 1)).on(\"error\", () => process.exit(1))'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      sync:
+        condition: service_healthy
+      vm:
+        condition: service_healthy
 
   # Socket.IO sync service (port 3003)
   sync:
-    image: oven/bun:latest
+    build: ./mini-services/sync-service
     restart: unless-stopped
-    working_dir: /app
     ports:
       - "3003:3003"
-    volumes:
-      - ./mini-services/sync-service:/app
-    command: bun run dev
+    environment:
+      - PORT=3003
+      - CORS_ORIGIN=*
+      - PUBLIC_URL=http://localhost:3000
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e 'fetch(\"http://localhost:3003/\").then(() => process.exit(0)).catch(() => process.exit(1))'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # Virtual browser service (port 3004)
-  # Note: requires Chrome installed in the container or host
   vm:
-    image: node:20-slim
+    build: ./vm-service
     restart: unless-stopped
-    working_dir: /app
     ports:
       - "3004:3004"
-    volumes:
-      - ./vm-service:/app
-    # Install Chrome + deps, then run
-    command: >
-      bash -c "
-        apt-get update && apt-get install -y chromium &&
-        npm install &&
-        node index.js
-      "
     environment:
+      - PORT=3004
+      - CORS_ORIGIN=*
+      - PUBLIC_URL=http://localhost:3000
       - CHROME_PATH=/usr/bin/chromium
+      - HEADLESS=true
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'require(\"http\").get(\"http://localhost:3004/health\", (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on(\"error\", () => process.exit(1))'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 volumes:
   app_db:

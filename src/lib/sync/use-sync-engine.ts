@@ -99,6 +99,11 @@ export interface SyncEngine {
   queueNext: () => void;
   queueSelect: (index: number) => void;
   queueRemove: (index: number) => void;
+  updateMediaState: (state: Partial<{
+    isMicMuted: boolean;
+    isCameraOn: boolean;
+    cameraPrivacyMode: "blackout" | "blur" | "avatar";
+  }>) => void;
 }
 
 /**
@@ -372,6 +377,17 @@ export function useSyncEngine({
     socketRef.current?.emit("vm:control:release", {});
   }, []);
 
+  const updateMediaState = useCallback(
+    (state: Partial<{
+      isMicMuted: boolean;
+      isCameraOn: boolean;
+      cameraPrivacyMode: "blackout" | "blur" | "avatar";
+    }>) => {
+      socketRef.current?.emit("media:state", state);
+    },
+    [],
+  );
+
   return {
     stats,
     playback,
@@ -394,5 +410,6 @@ export function useSyncEngine({
     queueNext,
     queueSelect,
     queueRemove,
+    updateMediaState,
   };
 }

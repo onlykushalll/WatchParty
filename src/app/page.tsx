@@ -36,6 +36,7 @@ import {
   Check,
   Plus,
   Sparkles,
+  Film,
   Globe,
   Zap,
   MonitorPlay,
@@ -45,12 +46,10 @@ import {
   Upload,
   ExternalLink,
   Pause,
-  Video,
-  VideoOff,
-  Radio,
 } from "lucide-react";
 
-// ── Inline theme hook (avoids module resolution issues) ──
+// ── Inline theme hook (avoids module resolution issues with Turbopack
+// in the user's home directory) ──
 type Theme = "light" | "dark";
 function useTheme() {
   const [theme, setThemeState] = useState<Theme>("dark");
@@ -84,13 +83,13 @@ export default function Home() {
   const [userName, setUserName] = useState<string>("");
   const [mobilePanel, setMobilePanel] = useState(false);
 
-  // Generate userId after mount (avoids hydration mismatch).
+  // Generate userId after mount (Math.random would cause hydration mismatch).
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setUserId(genId());
   }, []);
 
-  // Load persisted username after mount.
+  // Load persisted username after mount (avoids SSR hydration mismatch).
   useEffect(() => {
     const saved = localStorage.getItem("wp:userName");
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -223,7 +222,7 @@ function Landing({
   };
 
   return (
-    <div className="flex min-h-screen flex-col bg-background text-foreground transition-colors duration-300">
+    <div className="flex min-h-screen flex-col bg-background">
       {/* Top bar */}
       <header className="sticky top-0 z-20 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
@@ -236,7 +235,7 @@ function Landing({
             </span>
           </div>
           <Badge variant="secondary" className="hidden sm:flex">
-            <Sparkles className="mr-1 h-3 w-3 text-violet-500" /> real-time sync v3.0
+            <Sparkles className="mr-1 h-3 w-3" /> real-time sync
           </Badge>
           <div className="ml-auto flex items-center gap-1">
             <Button
@@ -246,9 +245,9 @@ function Landing({
               aria-label="Toggle theme"
             >
               {theme === "dark" ? (
-                <Sun className="h-4 w-4 text-amber-400" />
+                <Sun className="h-4 w-4" />
               ) : (
-                <Moon className="h-4 w-4 text-slate-700" />
+                <Moon className="h-4 w-4" />
               )}
             </Button>
           </div>
@@ -257,12 +256,12 @@ function Landing({
 
       {/* Hero */}
       <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col items-center px-4 py-10 sm:py-16">
-        <div className="mb-3 flex items-center gap-2 rounded-full border bg-card/50 px-3 py-1 text-xs text-muted-foreground shadow-sm">
+        <div className="mb-3 flex items-center gap-2 rounded-full border bg-card/50 px-3 py-1 text-xs text-muted-foreground">
           <span className="relative flex h-2 w-2">
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
             <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
           </span>
-          Cristian&apos;s NTP Clock Sync · 100ms Slewing Rate Controller
+          NTP-grade clock sync · 90ms drift tolerance
         </div>
         <h1 className="max-w-3xl text-center text-4xl font-bold tracking-tight sm:text-6xl">
           Watch anything,
@@ -272,12 +271,14 @@ function Landing({
           </span>
         </h1>
         <p className="mt-5 max-w-xl text-center text-base text-muted-foreground sm:text-lg">
-          Paste a link — YouTube, HLS (.m3u8), MP4, or co-browse any website together in a shared Virtual Machine desktop shell.
+          Paste a link — YouTube, a movie stream, an HLS feed, or any website.
+          Your friends see the same frame at the same instant. Chat, react,
+          and feel like you&apos;re on the same couch.
         </p>
 
         {/* Create / Join card */}
         <div className="mt-10 grid w-full max-w-3xl gap-4 sm:grid-cols-2">
-          <div className="rounded-xl border bg-card p-5 shadow-sm transition-all hover:shadow-md">
+          <div className="rounded-xl border bg-card p-5 shadow-sm">
             <div className="mb-3 flex items-center gap-2">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-500/10 text-violet-500">
                 <Plus className="h-4 w-4" />
@@ -292,7 +293,7 @@ function Landing({
               maxLength={32}
             />
             <Button
-              className="w-full bg-violet-600 hover:bg-violet-700 text-white"
+              className="w-full"
               onClick={createRoom}
               disabled={creating}
             >
@@ -302,14 +303,14 @@ function Landing({
                   Creating…
                 </span>
               ) : (
-                <span className="flex items-center gap-2 font-medium">
+                <span className="flex items-center gap-2">
                   Create room <ArrowRight className="h-3.5 w-3.5" />
                 </span>
               )}
             </Button>
           </div>
 
-          <div className="rounded-xl border bg-card p-5 shadow-sm transition-all hover:shadow-md">
+          <div className="rounded-xl border bg-card p-5 shadow-sm">
             <div className="mb-3 flex items-center gap-2">
               <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-500">
                 <Link2 className="h-4 w-4" />
@@ -342,25 +343,25 @@ function Landing({
           {[
             {
               icon: Zap,
-              title: "Cristian's NTP Sync",
-              desc: "Proportional slewing rate controller keeps video frames aligned within 100ms without audio popping.",
+              title: "Perfect sync",
+              desc: "Cristian's clock-sync algorithm keeps everyone on the same frame — drift auto-corrects within 100ms.",
             },
             {
               icon: Globe,
-              title: "Universal Video Support",
-              desc: "YouTube native player, HLS (.m3u8), direct MP4/WebM files, or local drag-and-drop video playback.",
+              title: "Universal video",
+              desc: "YouTube, HLS (.m3u8), MP4, WebM, or any website via a proxy that strips frame blockers.",
             },
             {
               icon: MonitorPlay,
-              title: "Shared Virtual PC (VM)",
-              desc: "Interactive co-browsing desktop with normalized multi-user remote cursors and control pass-off queue.",
+              title: "Browse together",
+              desc: "Co-browse any site in an embedded frame, or queue up a playlist and take turns controlling.",
             },
           ].map((f) => (
             <div
               key={f.title}
-              className="rounded-xl border bg-card/50 p-4 transition-all hover:bg-card"
+              className="rounded-xl border bg-card/50 p-4"
             >
-              <f.icon className="mb-2 h-5 w-5 text-violet-500" />
+              <f.icon className="mb-2 h-5 w-5 text-primary" />
               <h3 className="text-sm font-semibold">{f.title}</h3>
               <p className="mt-1 text-xs text-muted-foreground">{f.desc}</p>
             </div>
@@ -369,14 +370,15 @@ function Landing({
       </main>
 
       <footer className="border-t px-4 py-4 text-center text-xs text-muted-foreground">
-        Built with Next.js · Socket.IO · Cristian&apos;s NTP Sync · Zero-camera opt-in privacy
+        Built with Next.js · Socket.IO · Cristian&apos;s algorithm · No
+        account needed
       </footer>
       <Toaster />
     </div>
   );
 }
 
-/* ═══════════════════════ ROOM VIEW ═══════════════════════ */
+/* ═══════════════════════ ROOM ═══════════════════════ */
 
 function RoomView({
   roomSlug,
@@ -399,30 +401,10 @@ function RoomView({
   const { theme, setTheme } = useTheme();
   const [urlInput, setUrlInput] = useState("");
   const [copied, setCopied] = useState(false);
-  const [tab, setTab] = useState<"chat" | "queue" | "calls">("chat");
-  const [mode, setMode] = useState<"video" | "vm" | "external">("video");
+  const [tab, setTab] = useState<"chat" | "queue">("chat");
+  const [mode, setMode] = useState<"video" | "external">("video");
   const [countdown, setCountdown] = useState<number | null>(null);
-  const [externalUrl, setExternalUrl] = useState("https://cinevo.nl");
-  const [camEnabled, setCamEnabled] = useState(false);
-
-  // Auto-calculate VM Endpoint URL (Local vs Cloudflare Tunnel vs Production)
-  const vmUrl = useMemo(() => {
-    if (typeof window === "undefined") return "http://localhost:3004";
-    const host = window.location.hostname;
-    const proto = window.location.protocol;
-    if (host === "localhost" || host === "127.0.0.1") {
-      return "http://localhost:3004";
-    } else if (host.startsWith("preview-") || host.includes(".space-z.ai")) {
-      return "/?XTransformPort=3004";
-    } else {
-      const parts = host.split(".");
-      if (parts.length >= 3) {
-        parts[0] = "vm";
-        return `${proto}//${parts.join(".")}`;
-      }
-      return `${proto}//vm.${host}`;
-    }
-  }, []);
+  const [externalUrl, setExternalUrl] = useState("https://cinevo.nl/watch/movie/aashiqui-2-192558");
 
   const shareUrl = useMemo(
     () => (typeof window !== "undefined" ? `${window.location.origin}/#/room/${roomSlug}` : ""),
@@ -453,7 +435,7 @@ function RoomView({
       return;
     }
     window.open(url, "_blank", "noopener,noreferrer");
-    toast.success("Opened in new tab");
+    toast.success("Opened in new tab — both you and your friend need to open this URL");
   };
 
   const startCountdown = () => {
@@ -472,68 +454,60 @@ function RoomView({
     }, 1000);
   };
 
+  const syncPlay = () => {
+    engine.sendChat("▶️ Play — everyone press play!");
+    toast.success("Sync signal sent — everyone press play!");
+  };
+
   const syncPause = () => {
     engine.sendChat("⏸️ Pause — everyone pause!");
     toast.success("Sync signal sent — everyone pause!");
   };
 
+  const hasVideo = !!engine.playback?.videoUrl;
   const hasNext =
     engine.currentIndex >= 0 && engine.currentIndex + 1 < engine.queue.length;
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground transition-colors duration-300">
-      {/* ── Top Header Navigation ── */}
+    <div className="flex h-screen flex-col bg-background">
+      {/* ── Top bar with everything ── */}
       <header className="flex shrink-0 items-center gap-2 border-b bg-background/80 px-3 py-2 backdrop-blur sm:px-4">
-        <Button variant="ghost" size="sm" onClick={onLeave} className="gap-1.5 font-bold">
-          <Play className="h-4 w-4 fill-current text-violet-500" />
+        <Button variant="ghost" size="sm" onClick={onLeave} className="gap-1.5">
+          <Play className="h-3.5 w-3.5 fill-current" />
           <span className="hidden sm:inline">WatchParty</span>
         </Button>
 
-        {/* Mode Switcher: Video vs Virtual PC vs External */}
+        {/* Mode switcher */}
         <div className="flex shrink-0 rounded-lg border bg-muted/50 p-1">
           <button
             onClick={() => setMode("video")}
-            className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition-all ${
-              mode === "video"
-                ? "bg-background text-violet-500 shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
+            className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-semibold transition-all ${
+              mode === "video" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            <Play className="h-3 w-3" /> Video Player
-          </button>
-          <button
-            onClick={() => setMode("vm")}
-            className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition-all ${
-              mode === "vm"
-                ? "bg-background text-cyan-500 shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <Globe className="h-3 w-3" /> Virtual PC (VM)
+            <Play className="h-3 w-3" /> Video
           </button>
           <button
             onClick={() => setMode("external")}
-            className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-semibold transition-all ${
-              mode === "external"
-                ? "bg-background text-pink-500 shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
+            className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-semibold transition-all ${
+              mode === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
             }`}
           >
             <ExternalLink className="h-3 w-3" /> Watch Together
           </button>
         </div>
 
-        {/* Video Mode URL Quick-Add Bar */}
+        {/* Compact URL bar in header (video mode) */}
         {mode === "video" && (
           <>
             <Input
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="Paste YouTube, HLS (.m3u8), or MP4 URL…"
+              placeholder="Paste YouTube/MP4/HLS URL…"
               className="h-7 max-w-xs flex-1 text-xs"
               onKeyDown={(e) => e.key === "Enter" && addUrl()}
             />
-            <Button size="sm" className="h-7 gap-1 bg-violet-600 hover:bg-violet-700 text-white px-2.5 text-xs" onClick={addUrl}>
+            <Button size="sm" className="h-7 gap-1 px-2 text-xs" onClick={addUrl}>
               <Plus className="h-3 w-3" /> Add
             </Button>
             <label className="flex h-7 cursor-pointer items-center gap-1 rounded-md border bg-card/50 px-2 text-xs font-medium hover:bg-accent">
@@ -547,8 +521,10 @@ function RoomView({
                   const f = e.target.files?.[0];
                   if (f) {
                     const url = URL.createObjectURL(f);
-                    engine.queueAdd(url);
-                    toast.success("Local video file added");
+                    // Send as "file" type so the server knows it's a local file.
+                    // Each user uploads their own copy — sync handles play/pause/seek.
+                    engine.sendIntent({ videoUrl: url, videoType: "mp4" });
+                    toast.success("Movie loaded — play/pause/seek syncs with everyone");
                   }
                 }}
               />
@@ -557,12 +533,12 @@ function RoomView({
         )}
 
         <div className="min-w-0 flex-1">
-          <h1 className="truncate text-xs font-semibold text-muted-foreground">
+          <h1 className="truncate text-sm font-semibold">
             {roomName || `room/${roomSlug}`}
           </h1>
         </div>
 
-        {/* Room Participants Hover Card */}
+        {/* Participants hover dropdown */}
         <div className="group relative shrink-0">
           <button className="flex h-8 items-center gap-1.5 rounded-lg border bg-card/50 px-2.5 text-xs font-medium hover:bg-accent transition-colors">
             <Users className="h-3.5 w-3.5" />
@@ -571,7 +547,7 @@ function RoomView({
               {engine.participants.slice(0, 3).map((p) => (
                 <div
                   key={p.userId}
-                  className="h-5 w-5 rounded-full border-2 border-background text-[9px] font-bold leading-5 text-white text-center"
+                  className="h-5 w-5 rounded-full border-2 border-background text-[9px] font-bold leading-5 text-white"
                   style={{ backgroundColor: p.color }}
                 >
                   {p.name.slice(0, 2).toUpperCase()}
@@ -579,8 +555,7 @@ function RoomView({
               ))}
             </div>
           </button>
-
-          {/* Hover Dropdown Menu */}
+          {/* Hover dropdown */}
           <div className="invisible absolute right-0 top-full z-50 mt-1 w-56 rounded-lg border bg-popover p-2 opacity-0 shadow-lg transition-all group-hover:visible group-hover:opacity-100">
             <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
               {engine.participants.length} online
@@ -614,7 +589,7 @@ function RoomView({
           variant="outline"
           size="sm"
           onClick={copyLink}
-          className="hidden gap-1.5 sm:flex text-xs h-8"
+          className="hidden gap-1.5 sm:flex"
         >
           {copied ? (
             <Check className="h-3.5 w-3.5 text-emerald-500" />
@@ -627,21 +602,20 @@ function RoomView({
         <Button
           variant="ghost"
           size="icon"
-          className="h-8 w-8"
           onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
           aria-label="Toggle theme"
         >
           {theme === "dark" ? (
-            <Sun className="h-4 w-4 text-amber-400" />
+            <Sun className="h-4 w-4" />
           ) : (
-            <Moon className="h-4 w-4 text-slate-700" />
+            <Moon className="h-4 w-4" />
           )}
         </Button>
 
-        {/* Mobile Panel Toggle */}
+        {/* Mobile panel toggle */}
         <Sheet open={mobilePanel} onOpenChange={setMobilePanel}>
           <SheetTrigger asChild>
-            <Button variant="outline" size="icon" className="h-8 w-8 lg:hidden">
+            <Button variant="outline" size="icon" className="lg:hidden">
               <Menu className="h-4 w-4" />
             </Button>
           </SheetTrigger>
@@ -651,101 +625,98 @@ function RoomView({
               setTab={setTab}
               engine={engine}
               userId={userId}
-              camEnabled={camEnabled}
-              setCamEnabled={setCamEnabled}
             />
           </SheetContent>
         </Sheet>
       </header>
 
-      {/* ── Main Canvas Stage (Strict 16:9 Aspect Ratio Widescreen Protection) ── */}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <main className="flex min-w-0 flex-1 flex-col items-center justify-center bg-zinc-950 p-2 sm:p-4">
-          
-          {/* 16:9 Widescreen Container: NEVER STRETCHED */}
-          <div
-            className="relative w-full overflow-hidden rounded-xl border border-zinc-800 bg-black shadow-2xl"
-            style={{
-              aspectRatio: "16 / 9",
-              maxHeight: "calc(100vh - 120px)",
-              maxWidth: "min(100%, calc((100vh - 120px) * (16 / 9)))",
-            }}
-          >
-            {mode === "video" && (
-              <UniversalPlayer
-                playback={engine.playback}
-                clockOffset={engine.stats.clockOffset}
-                onIntent={engine.sendIntent}
-                onNext={() => engine.queueNext()}
-                hasNext={hasNext}
-              />
-            )}
-
-            {mode === "vm" && (
-              <VirtualBrowser
-                vmUrl={vmUrl}
-                password=""
-                userName={userName}
-                userColor={engine.you?.color || "#a78bfa"}
-                userId={userId}
-                remoteCursors={engine.remoteCursors}
-                controllerId={engine.vmController}
-                controlQueue={engine.vmControlQueue}
-                onCursorMove={engine.sendVmCursor}
-                onRequestControl={engine.requestVmControl}
-                onReleaseControl={engine.releaseVmControl}
-              />
-            )}
-
-            {mode === "external" && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-5 bg-zinc-950 p-6">
+      {/* ── Main: full-height video + side panel ── */}
+      <div className="flex min-h-0 flex-1">
+        <main className="flex min-w-0 flex-1 flex-col">
+          {/* Stage: full-height Video or Watch Together */}
+          <div className="relative min-h-0 flex-1 bg-black">
+            {mode === "video" ? (
+              <div className="absolute inset-0">
+                <UniversalPlayer
+                  playback={engine.playback}
+                  clockOffset={engine.stats.clockOffset}
+                  onIntent={engine.sendIntent}
+                  onNext={() => engine.queueNext()}
+                  hasNext={hasNext}
+                />
+              </div>
+            ) : (
+              /* Watch Together mode — open external site + sync buttons */
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-zinc-950 p-8">
                 {countdown !== null && (
-                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur">
-                    <span className="text-[120px] font-bold text-violet-400 animate-pulse">{countdown}</span>
+                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90">
+                    <span className="text-[120px] font-bold text-violet-400">{countdown}</span>
                   </div>
                 )}
                 <div className="text-center">
-                  <h2 className="text-xl font-bold text-white">Watch Together Sync</h2>
-                  <p className="mt-1 text-xs text-zinc-400">
-                    Open any movie site in an external browser tab, then trigger synchronization.
+                  <h2 className="text-2xl font-bold text-white">Watch Together</h2>
+                  <p className="mt-2 text-sm text-zinc-400">
+                    Open the movie site in a new tab, then sync with your friend
                   </p>
                 </div>
 
-                <div className="flex w-full max-w-md items-center gap-2">
+                {/* URL input */}
+                <div className="flex w-full max-w-lg items-center gap-2">
                   <Input
                     value={externalUrl}
                     onChange={(e) => setExternalUrl(e.target.value)}
                     placeholder="https://cinevo.nl/watch/movie/..."
-                    className="h-9 flex-1 bg-zinc-900 text-xs text-white"
+                    className="h-10 flex-1 bg-zinc-900 text-sm text-white"
                   />
-                  <Button className="h-9 gap-1.5 bg-violet-600 hover:bg-violet-700 text-white text-xs" onClick={openExternal}>
-                    <ExternalLink className="h-3.5 w-3.5" /> Open
+                  <Button className="h-10 gap-2" onClick={openExternal}>
+                    <ExternalLink className="h-4 w-4" /> Open
                   </Button>
                 </div>
 
+                <p className="max-w-md text-center text-xs text-zinc-500">
+                  This opens the movie site in a new tab for you. Share the room link with your friend — they open the same URL. Then use the sync buttons below to start together.
+                </p>
+
+                {/* Sync buttons */}
                 <div className="flex gap-3">
-                  <Button size="sm" className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs" onClick={startCountdown}>
-                    <Play className="h-4 w-4" /> 3-2-1 Sync Start
+                  <Button size="lg" className="gap-2 bg-emerald-600 hover:bg-emerald-700" onClick={startCountdown}>
+                    <Play className="h-5 w-5" /> 3-2-1 Sync Start
                   </Button>
-                  <Button size="sm" variant="outline" className="gap-1.5 text-xs border-zinc-700 text-zinc-200" onClick={syncPause}>
-                    <Pause className="h-4 w-4" /> Sync Pause
+                  <Button size="lg" variant="outline" className="gap-2" onClick={syncPause}>
+                    <Pause className="h-5 w-5" /> Sync Pause
                   </Button>
+                </div>
+
+                {/* Copy room link */}
+                <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-2">
+                  <span className="text-xs text-zinc-500">Share room link:</span>
+                  <code className="text-xs text-violet-300">{shareUrl}</code>
+                  <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={copyLink}>
+                    {copied ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+                  </Button>
+                </div>
+
+                {/* Sync status */}
+                <div className="flex items-center gap-2 text-xs text-zinc-500">
+                  <SyncIndicator
+                    connected={engine.stats.connected}
+                    rtt={engine.stats.rtt}
+                    drift={engine.stats.clockOffset}
+                  />
+                  <span>· Chat is live — coordinate with your friend</span>
                 </div>
               </div>
             )}
           </div>
-
         </main>
 
-        {/* Desktop Sidebar (WhatsApp Chat, Queue, Opt-in Calls) */}
+        {/* Desktop side panel */}
         <aside className="hidden w-80 shrink-0 border-l bg-card/30 lg:flex lg:flex-col">
           <SidePanel
             tab={tab}
             setTab={setTab}
             engine={engine}
             userId={userId}
-            camEnabled={camEnabled}
-            setCamEnabled={setCamEnabled}
           />
         </aside>
       </div>
@@ -755,31 +726,27 @@ function RoomView({
   );
 }
 
-/* ─────────────────────────── Side Panel Component ─────────────────────────── */
+/* ─────────────────────────── Side panel ─────────────────────────── */
 
 function SidePanel({
   tab,
   setTab,
   engine,
   userId,
-  camEnabled,
-  setCamEnabled,
 }: {
-  tab: "chat" | "queue" | "calls";
-  setTab: (t: "chat" | "queue" | "calls") => void;
+  tab: "chat" | "queue";
+  setTab: (t: "chat" | "queue") => void;
   engine: ReturnType<typeof useSyncEngine>;
   userId: string;
-  camEnabled: boolean;
-  setCamEnabled: (v: boolean) => void;
 }) {
   return (
     <div className="flex h-full flex-col">
       <Tabs
         value={tab}
-        onValueChange={(v) => setTab(v as "chat" | "queue" | "calls")}
+        onValueChange={(v) => setTab(v as "chat" | "queue")}
         className="flex h-full flex-col"
       >
-        <TabsList className="m-2 grid grid-cols-3 bg-muted/60 p-1">
+        <TabsList className="m-2 grid grid-cols-2">
           <TabsTrigger value="chat" className="gap-1 text-xs">
             <MessageSquare className="h-3.5 w-3.5" /> Chat
           </TabsTrigger>
@@ -791,11 +758,7 @@ function SidePanel({
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="calls" className="gap-1 text-xs">
-            <Video className="h-3.5 w-3.5" /> Calls
-          </TabsTrigger>
         </TabsList>
-
         <TabsContent value="chat" className="mt-0 min-h-0 flex-1">
           <ChatPanel
             messages={engine.messages}
@@ -805,7 +768,6 @@ function SidePanel({
             participantCount={engine.participants.length}
           />
         </TabsContent>
-
         <TabsContent value="queue" className="mt-0 min-h-0 flex-1">
           <QueuePanel
             items={engine.queue}
@@ -813,51 +775,6 @@ function SidePanel({
             onSelect={engine.queueSelect}
             onRemove={engine.queueRemove}
           />
-        </TabsContent>
-
-        <TabsContent value="calls" className="mt-0 min-h-0 flex-1 p-3">
-          {!camEnabled ? (
-            <div className="flex h-full flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-muted-foreground/30 p-6 text-center">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full bg-violet-500/10 text-violet-500">
-                <VideoOff className="h-6 w-6" />
-              </div>
-              <div>
-                <h3 className="text-sm font-semibold">Camera is Off</h3>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Your privacy comes first. Click below if you wish to enable your webcam and mic.
-                </p>
-              </div>
-              <Button
-                size="sm"
-                className="mt-2 gap-2 bg-violet-600 hover:bg-violet-700 text-white"
-                onClick={() => {
-                  setCamEnabled(true);
-                  toast.success("Webcam opt-in enabled");
-                }}
-              >
-                <Video className="h-4 w-4" /> Enable Camera & Mic
-              </Button>
-            </div>
-          ) : (
-            <div className="flex h-full flex-col gap-3">
-              <div className="relative aspect-video overflow-hidden rounded-lg border bg-black shadow-md">
-                <div className="absolute left-2 top-2 z-10 flex items-center gap-1 rounded bg-black/60 px-2 py-0.5 text-[10px] text-white">
-                  <Radio className="h-3 w-3 text-emerald-400 animate-pulse" /> You (Host)
-                </div>
-                <div className="flex h-full items-center justify-center text-xs text-zinc-500">
-                  Webcam Active (Opt-In)
-                </div>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                className="mt-auto text-xs text-rose-500 border-rose-500/20 hover:bg-rose-500/10"
-                onClick={() => setCamEnabled(false)}
-              >
-                Turn Off Camera
-              </Button>
-            </div>
-          )}
         </TabsContent>
       </Tabs>
     </div>

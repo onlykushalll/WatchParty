@@ -17,6 +17,9 @@ export interface Participant {
   color: string;
   isHost: boolean;
   joinedAt: number;
+  isMicMuted?: boolean;
+  isCameraOn?: boolean;
+  cameraPrivacyMode?: 'blackout' | 'blur' | 'avatar';
 }
 
 export interface QueueItem {

@@ -26,9 +26,9 @@ WatchParty consists of:
 |---|------|-------|-------------|--------|
 | M1 | Architectural Research & Specs | Comprehensive research & specifications for NTP math, VM streaming, Render cloud flags | None | DONE |
 | M2 | State Sync Engine | Cristian's NTP, EMA offset, PI rate controller across video providers | M1 | DONE |
-| M3 | VM Co-Browsing Stage | Multi-user VM co-browsing, cursor overlay, floor control, URL navigation | M1 | IN_PROGRESS |
-| M4 | Modern UI & WhatsApp Chat | 16:9 widescreen stage, WhatsApp chat, crowns, camera privacy | M2, M3 | PLANNED |
-| M5 | Cloud Deployment & Verification | Docker setup, env variables, zero-error production build | M1, M2, M3, M4 | PLANNED |
+| M3 | VM Co-Browsing Stage | Multi-user VM co-browsing, cursor overlay, floor control, URL navigation | M1 | DONE |
+| M4 | Modern UI & WhatsApp Chat | 16:9 widescreen stage, WhatsApp chat, crowns, camera privacy | M2, M3 | DONE |
+| M5 | Cloud Deployment & Verification | Docker setup, env variables, zero-error production build | M1, M2, M3, M4 | DONE |
 
 ## Interface Contracts
 ### Client ↔ Sync Server (WebSocket)

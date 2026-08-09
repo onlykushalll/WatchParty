@@ -17,8 +17,10 @@ import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 import { FloorControlManager, normalizeCoordinates } from "./index";
+import os from "os";
+import path from "path";
 
-const PORT = 3004;
+const PORT = Number(process.env.PORT || process.env.VM_PORT || 3004);
 const DEFAULT_CHROME_PATH =
   process.platform === "win32"
     ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
@@ -68,9 +70,9 @@ function broadcastGrantControl(controllerId: string | null) {
 async function launchBrowser() {
   console.log(`[vm] Launching dedicated Chrome via executable: ${CHROME_PATH} (Headless: ${IS_HEADLESS})…`);
 
-  // Use a dedicated user-data-dir so this Chrome is completely separate
+  // Use a dedicated user-data-dir in system temp directory so this Chrome is completely separate
   // from the user's personal Chrome — no cookies, no history, no tabs.
-  const userDataDir = "C:\\Users\\Default.L-HCG-9FVVGS3\\vm-chrome-profile";
+  const userDataDir = path.join(os.tmpdir(), "vm-chrome-profile");
 
   browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
@@ -89,11 +91,13 @@ async function launchBrowser() {
       "--disable-default-apps",
       "--metrics-recording-only",
       "--no-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
       "--disable-blink-features=AutomationControlled",
       "--exclude-switches=enable-automation",
       // Low-RAM optimization flags from the research report
       "--renderer-process-limit=2",
-      "--js-flags=--max-old-space-size=512",
+      '--js-flags="--max-old-space-size=512"',
       "--memory-pressure-off",
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
