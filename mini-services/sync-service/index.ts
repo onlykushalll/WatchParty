@@ -176,11 +176,18 @@ io.on("connection", (socket: Socket) => {
   let currentUserId: string | null = null;
 
   // ── Clock sync (Cristian's algorithm) ──
-  socket.on("clock:req", (payload: { t1: number }) => {
+  socket.on("clock:req", (payload: { t0?: number; t1?: number }) => {
+    const t0 = payload?.t0 ?? payload?.t1 ?? Date.now();
+    const t1 = Date.now();
     const t2 = Date.now();
-    // Small artificial delay simulates processing; t3 is when we send back.
-    const t3 = Date.now();
-    socket.emit("clock:res", { t1: payload.t1, t2, t3 });
+    socket.emit("clock:res", { t0, t1, t2 });
+  });
+
+  socket.on("ntp_ping", (payload: { clientTime?: number; t0?: number }) => {
+    const t0 = payload?.t0 ?? payload?.clientTime ?? Date.now();
+    const t1 = Date.now();
+    const t2 = Date.now();
+    socket.emit("ntp_pong", { t0, t1, t2, clientTime: t0, serverTime: t2 });
   });
 
   // ── Join room ──
@@ -533,15 +540,16 @@ io.on("connection", (socket: Socket) => {
       broadcastPresence(io, r);
     }
     // Schedule cleanup if empty.
-    if (r.participants.size === 0) {
+    if (r.participants.size === 0 && currentRoomId) {
+      const targetRoomId = currentRoomId;
       setTimeout(() => {
-        const stillEmpty = rooms.get(currentRoomId);
+        const stillEmpty = rooms.get(targetRoomId);
         if (
           stillEmpty &&
           stillEmpty.participants.size === 0 &&
           Date.now() - stillEmpty.lastActivity > ROOM_EXPIRY_MS
         ) {
-          rooms.delete(currentRoomId!);
+          rooms.delete(targetRoomId);
         }
       }, ROOM_EXPIRY_MS);
     }

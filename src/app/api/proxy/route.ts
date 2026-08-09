@@ -160,7 +160,7 @@ export async function GET(req: NextRequest) {
     headers.set("content-type", "text/html; charset=utf-8");
   }
 
-  return new NextResponse(body, {
+  return new NextResponse(new Uint8Array(body), {
     status: finalRes.status,
     headers,
   });

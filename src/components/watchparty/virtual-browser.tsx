@@ -75,7 +75,8 @@ export function VirtualBrowser({
     ws.onmessage = (e) => {
       if (cancelled) return;
       const data = new Uint8Array(e.data as ArrayBuffer);
-      if (data[0] === 1) {
+      const type = data[0];
+      if (type === 1) {
         // JPEG frame
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -101,6 +102,15 @@ export function VirtualBrowser({
           }
         };
         img.src = url;
+      } else if (type === 12) {
+        // CDP frame navigation push event from VM service
+        try {
+          const payloadStr = new TextDecoder().decode(data.slice(1));
+          const payload = JSON.parse(payloadStr);
+          if (payload.url) {
+            setUrlBar(payload.url);
+          }
+        } catch (err) {}
       }
     };
 
@@ -119,41 +129,34 @@ export function VirtualBrowser({
         setTimeout(() => {
           if (!cancelled) {
             wsRef.current = null;
-            // Trigger reconnect by re-running effect
           }
         }, 2000);
       }
     };
 
-    // Poll URL bar
-    const urlInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        fetch(`${vmUrl}/url`)
-          .then((r) => r.json())
-          .then((d) => {
-            if (d.url && d.url !== urlBar) setUrlBar(d.url);
-          })
-          .catch(() => {});
-      }
-    }, 3000);
-
     return () => {
       cancelled = true;
-      clearInterval(urlInterval);
       ws.close();
       wsRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsUrl]);
 
   // Auto-request control when VM mode loads (first user gets it)
   useEffect(() => {
     if (!controllerId && !controlQueue.includes(userId)) {
-      const timer = setTimeout(() => onRequestControl(), 1500);
+      const timer = setTimeout(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          const payload = new TextEncoder().encode(JSON.stringify({ userId, userName }));
+          const msg = new Uint8Array(1 + payload.length);
+          msg[0] = 16;
+          msg.set(payload, 1);
+          wsRef.current.send(msg);
+        }
+        onRequestControl();
+      }, 1500);
       return () => clearTimeout(timer);
     }
-  }, []); // Only on mount
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [controllerId, controlQueue, userId, userName, onRequestControl]);
 
   // Native event listeners on canvas — bypasses React 19 synthetic event
   // issues. These are attached via useEffect and read the latest
@@ -172,26 +175,38 @@ export function VirtualBrowser({
     }
   };
 
+  const handleRequestControl = useCallback(() => {
+    sendMsg(16, { userId, userName });
+    onRequestControl();
+  }, [userId, userName, onRequestControl]);
+
+  const handleReleaseControl = useCallback(() => {
+    sendMsg(17, { userId });
+    onReleaseControl();
+  }, [userId, onReleaseControl]);
+
+  const getNormalizedCoords = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { xNorm: 0, yNorm: 0 };
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return { xNorm: 0, yNorm: 0 };
+    const xNorm = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const yNorm = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    return { xNorm, yNorm };
+  };
+
   // Mouse handlers — directly on canvas via React props
   const handleMouseMove = (e: React.MouseEvent) => {
     if (!isControllerRef.current) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
-    const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
-    sendMsg(2, { x, y });
-    onCursorMove((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
+    const { xNorm, yNorm } = getNormalizedCoords(e);
+    sendMsg(2, { xNorm, yNorm });
+    onCursorMove(xNorm, yNorm);
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
     if (!isControllerRef.current) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
-    const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
-    sendMsg(3, { x, y, button: e.button === 2 ? "right" : "left" });
+    const { xNorm, yNorm } = getNormalizedCoords(e);
+    sendMsg(3, { xNorm, yNorm, button: e.button === 2 ? "right" : "left" });
     e.preventDefault();
   };
 
@@ -225,9 +240,14 @@ export function VirtualBrowser({
   }, [isController]);
 
   const navigate = (url: string) => {
-    url = url.trim();
+    url = (url || "").trim();
     if (!url) return;
-    if (!url.match(/^https?:\/\//)) url = "https://" + url;
+    const lower = url.toLowerCase();
+    const forbiddenSchemes = ["file:", "chrome:", "chrome-extension:", "javascript:", "data:", "about:"];
+    if (forbiddenSchemes.some((scheme) => lower.startsWith(scheme))) {
+      return;
+    }
+    if (!/^https?:\/\//i.test(url)) url = "https://" + url;
     setUrlBar(url);
     sendMsg(7, { url });
   };
@@ -288,7 +308,7 @@ export function VirtualBrowser({
 
         {/* Control button */}
         {isController ? (
-          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={onReleaseControl}>
+          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={handleReleaseControl}>
             <Unlock className="h-3 w-3" /> Release
           </Button>
         ) : controllerId ? (
@@ -297,12 +317,12 @@ export function VirtualBrowser({
               <Hand className="h-3 w-3" /> Queue #{queuePosition + 1}
             </span>
           ) : (
-            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
+            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={handleRequestControl}>
               <Hand className="h-3 w-3" /> Request
             </Button>
           )
         ) : (
-          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
+          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={handleRequestControl}>
             <Lock className="h-3 w-3" /> Take control
           </Button>
         )}

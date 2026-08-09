@@ -9,14 +9,17 @@ import {
   Reaction,
 } from "./types";
 
+import { ClockSyncEstimator } from "./clock-sync";
+
 // Minimal Socket type (avoids importing socket.io-client at build time,
 // which Turbopack can't resolve when the project is in the user's home dir).
 interface Socket {
-  on(event: string, fn: (...args: unknown[]) => void): Socket;
-  on(event: string, fn: (arg: unknown) => void): Socket;
-  emit(event: string, ...args: unknown[]): Socket;
+  on(event: string, fn: (...args: any[]) => void): Socket;
+  on(event: string, fn: (arg: any) => void): Socket;
+  emit(event: string, ...args: any[]): Socket;
   disconnect(): Socket;
   id?: string;
+  connected?: boolean;
 }
 
 type IoFn = (url: string, opts: Record<string, unknown>) => Socket;
@@ -28,7 +31,7 @@ type IoFn = (url: string, opts: Record<string, unknown>) => Socket;
 let ioPromise: Promise<IoFn> | null = null;
 async function getIo(): Promise<IoFn> {
   if (typeof window === "undefined") {
-    return (() => ({})) as IoFn;
+    return (() => ({})) as unknown as IoFn;
   }
   const w = window as any;
   if (w.io) return w.io as IoFn;
@@ -103,12 +106,8 @@ export interface SyncEngine {
  *
  * Connects to the WatchParty sync service (port 3003 via Caddy
  * XTransformPort), performs Cristian's-algorithm clock sync on connect +
- * every 30s, and exposes the authoritative room state plus action
+ * every 10s (with 8 initial probes on connect), and exposes the authoritative room state plus action
  * senders.
- *
- * NOTE: this hook only carries state. The actual <video> element control
- * (the guard-flag echo-loop fix + 3-tier drift correction) lives in
- * useVideoController, which calls sendIntent / reads playback.
  */
 export function useSyncEngine({
   roomId,
@@ -116,6 +115,7 @@ export function useSyncEngine({
   userName,
 }: UseSyncEngineArgs): SyncEngine {
   const socketRef = useRef<Socket | null>(null);
+  const estimatorRef = useRef(new ClockSyncEstimator());
   const [stats, setStats] = useState<SyncStats>({
     connected: false,
     clockOffset: 0,
@@ -134,9 +134,21 @@ export function useSyncEngine({
   const [vmControlQueue, setVmControlQueue] = useState<string[]>([]);
 
   // ── Clock sync (Cristian's algorithm) ──
-  const runClockSync = useCallback((sock: Socket) => {
-    const t1 = Date.now();
-    sock.emit("clock:req", { t1 });
+  const runClockProbe = useCallback((sock: Socket) => {
+    sock.emit("clock:req", { t0: Date.now() });
+  }, []);
+
+  const runInitialProbeBurst = useCallback((sock: Socket) => {
+    estimatorRef.current.reset();
+    let count = 0;
+    const burst = () => {
+      if (count < 8 && sock.connected !== false) {
+        sock.emit("clock:req", { t0: Date.now() });
+        count++;
+        setTimeout(burst, 50);
+      }
+    };
+    burst();
   }, []);
 
   useEffect(() => {
@@ -145,19 +157,14 @@ export function useSyncEngine({
     let sock: Socket | null = null;
 
     // Determine the sync socket URL based on where we're running.
-    // Auto-detects: if on a tunnel domain (e.g. wp.example.com), use
-    // sync.example.com. If localhost, use localhost:3003.
     const host = typeof window !== "undefined" ? window.location.hostname : "";
     const proto = typeof window !== "undefined" ? window.location.protocol : "https:";
     let syncUrl: string;
     if (host === "localhost" || host === "127.0.0.1") {
       syncUrl = "http://localhost:3003";
     } else if (host.startsWith("preview-") || host.includes(".space-z.ai")) {
-      // Sandbox preview — use Caddy XTransformPort pattern
       syncUrl = "/?XTransformPort=3003";
     } else {
-      // Production tunnel — derive sync subdomain from host
-      // e.g. wp.kushalneedsmcp.online → sync.kushalneedsmcp.online
       const parts = host.split(".");
       if (parts.length >= 3) {
         parts[0] = "sync";
@@ -166,7 +173,6 @@ export function useSyncEngine({
         syncUrl = `${proto}//sync.${host}`;
       }
     }
-
 
     getIo().then((ioFn) => {
       if (cancelled) return;
@@ -184,27 +190,42 @@ export function useSyncEngine({
       sock.on("connect", () => {
         setStats((s) => ({ ...s, connected: true }));
         sock!.emit("room:join", { roomId, userId, name: userName });
-        runClockSync(sock!);
+        runInitialProbeBurst(sock!);
       });
 
-      sock.on("disconnect", (reason: string) => {
+      sock.on("disconnect", () => {
         setStats((s) => ({ ...s, connected: false }));
       });
 
-      sock.on("connect_error", (err: Error) => {
+      sock.on("connect_error", () => {
         setStats((s) => ({ ...s, connected: false }));
       });
 
-      sock.on("clock:res", (p: { t1: number; t2: number; t3: number }) => {
-        const t4 = Date.now();
-        const rtt = t4 - p.t1;
-        const serverNow = p.t3 + rtt / 2;
-        const offset = serverNow - t4;
+      sock.on("clock:res", (p: { t0?: number; t1: number; t2: number; t3?: number }) => {
+        const t3 = Date.now();
+        const t0 = p.t0 ?? p.t1;
+        const t1 = p.t1;
+        const t2 = p.t2 ?? p.t1;
+        const res = estimatorRef.current.processProbe(t0, t1, t2, t3);
         setStats((s) => ({
           ...s,
-          clockOffset: offset,
-          rtt,
-          lastDriftMs: Math.abs(offset),
+          clockOffset: res.offset,
+          rtt: res.rtt,
+          lastDriftMs: Math.abs(res.offset),
+        }));
+      });
+
+      sock.on("ntp_pong", (p: { t0?: number; t1: number; t2: number; t3?: number }) => {
+        const t3 = Date.now();
+        const t0 = p.t0 ?? p.t1;
+        const t1 = p.t1;
+        const t2 = p.t2 ?? p.t1;
+        const res = estimatorRef.current.processProbe(t0, t1, t2, t3);
+        setStats((s) => ({
+          ...s,
+          clockOffset: res.offset,
+          rtt: res.rtt,
+          lastDriftMs: Math.abs(res.offset),
         }));
       });
 
@@ -271,7 +292,6 @@ export function useSyncEngine({
           const filtered = prev.filter((p) => p.userId !== c.userId);
           return [...filtered, c];
         });
-        // Expire cursor after 5s of no movement
         setTimeout(() => {
           setRemoteCursors((prev) => prev.filter((p) => p !== c));
         }, 5000);
@@ -290,8 +310,8 @@ export function useSyncEngine({
     });
 
     const clockInterval = setInterval(() => {
-      if (socketRef.current) runClockSync(socketRef.current);
-    }, 30000);
+      if (socketRef.current) runClockProbe(socketRef.current);
+    }, 10000);
 
     return () => {
       cancelled = true;
@@ -301,7 +321,7 @@ export function useSyncEngine({
         socketRef.current = null;
       }
     };
-  }, [roomId, userId, userName, runClockSync]);
+  }, [roomId, userId, userName, runClockProbe, runInitialProbeBurst]);
 
   const sendIntent = useCallback(
     (patch: Partial<{

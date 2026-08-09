@@ -14,6 +14,8 @@ interface UseVideoControllerArgs {
   }>) => void;
 }
 
+import { PISlewingController } from "./pi-controller";
+
 /**
  * useVideoController
  *
@@ -24,13 +26,10 @@ interface UseVideoControllerArgs {
  *     so the resulting 'play'/'pause'/'seek' events are NOT re-broadcast.
  *  2. Seek debounce — HTML5 seek fires pause→seeking→seeked→play; we
  *     collect events in a 200ms window and send only the final state.
- *  3. 3-tier drift correction on incoming state:
- *       |Δ| ≤ 100ms  → leave alone
- *       100ms < |Δ| ≤ 1500ms → soft rate adjust (1.05x / 0.95x)
- *       |Δ| > 1500ms → hard seek
- *
- * Takes a RefObject (not the element itself) so we don't access the ref
- * during render and don't trip the immutability lint rule.
+ *  3. Proportional-Integral (PI) slewing rate controller:
+ *       |Δ| ≤ 100ms  → deadband (leave alone)
+ *       100ms < |Δ| ≤ 1000ms → PI continuous rate slewing (0.95x to 1.05x with anti-windup)
+ *       |Δ| > 1000ms → hard seek to expected playhead
  */
 export function useVideoController({
   videoRef,
@@ -40,8 +39,9 @@ export function useVideoController({
 }: UseVideoControllerArgs) {
   const guardRef = useRef(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const softRateRef = useRef(1);
+  const piControllerRef = useRef(new PISlewingController());
   const lastAppliedSeq = useRef(-1);
+  const lastTickTimeRef = useRef<number>(Date.now());
 
   // ── Outgoing: listen to user-driven events on the video element ──
   useEffect(() => {
@@ -94,39 +94,37 @@ export function useVideoController({
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !playback || playback.videoType === "youtube" || playback.videoType === "iframe") return;
-    if (playback.seq === lastAppliedSeq.current) return;
+
+    const isInitialJoin = lastAppliedSeq.current === -1;
+    if (playback.seq === lastAppliedSeq.current && !isInitialJoin) return;
     lastAppliedSeq.current = playback.seq;
 
     guardRef.current = true;
 
     const desiredRate = playback.playbackRate || 1;
-    videoEl.playbackRate = desiredRate;
-
     const serverNow = Date.now() + clockOffset;
     const elapsedSinceChange = playback.isPlaying
       ? (serverNow - playback.lastChangedAt) / 1000
       : 0;
-    const expectedTime = playback.currentTime + elapsedSinceChange;
-
+    const expectedTime = playback.currentTime + elapsedSinceChange * desiredRate;
     const actualTime = videoEl.currentTime;
     const delta = Math.abs(actualTime - expectedTime);
 
-    if (delta > 1.5) {
+    // Initial join or large desync (> 1.0s) -> Instant Seek
+    if (isInitialJoin || delta > 1.0) {
       videoEl.currentTime = expectedTime;
-      softRateRef.current = 1;
-    } else if (delta > 0.1) {
-      if (actualTime < expectedTime) {
-        videoEl.playbackRate = Math.max(desiredRate * 1.05, 0.1);
-        softRateRef.current = desiredRate * 1.05;
-      } else {
-        videoEl.playbackRate = Math.max(desiredRate * 0.95, 0.1);
-        softRateRef.current = desiredRate * 0.95;
-      }
+      videoEl.playbackRate = desiredRate;
+      piControllerRef.current.reset();
     } else {
-      if (Math.abs(videoEl.playbackRate - desiredRate) > 0.01) {
+      const res = piControllerRef.current.compute(expectedTime, actualTime, 0.5, desiredRate);
+      if (res.action === "SEEK") {
+        videoEl.currentTime = expectedTime;
+        videoEl.playbackRate = desiredRate;
+      } else if (res.action === "SLEW") {
+        videoEl.playbackRate = res.slewRate;
+      } else {
         videoEl.playbackRate = desiredRate;
       }
-      softRateRef.current = desiredRate;
     }
 
     if (playback.isPlaying && videoEl.paused) {
@@ -140,31 +138,40 @@ export function useVideoController({
     });
   }, [videoRef, playback, clockOffset]);
 
-  // ── Periodic drift self-correction ──
+  // ── Periodic drift self-correction (500ms ticker with PI controller) ──
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !playback || !playback.isPlaying || playback.videoType === "youtube" || playback.videoType === "iframe") return;
 
+    lastTickTimeRef.current = Date.now();
+
     const id = setInterval(() => {
       if (guardRef.current) return;
-      const serverNow = Date.now() + clockOffset;
-      const elapsed = (serverNow - playback.lastChangedAt) / 1000;
-      const expected = playback.currentTime + elapsed * (playback.playbackRate || 1);
-      const actual = videoEl.currentTime;
-      const delta = actual - expected;
+      const now = Date.now();
+      const dt = (now - lastTickTimeRef.current) / 1000;
+      lastTickTimeRef.current = now;
 
-      if (Math.abs(delta) > 1.5) {
+      const serverNow = now + clockOffset;
+      const elapsed = (serverNow - playback.lastChangedAt) / 1000;
+      const desiredRate = playback.playbackRate || 1;
+      const expected = playback.currentTime + elapsed * desiredRate;
+      const actual = videoEl.currentTime;
+
+      const res = piControllerRef.current.compute(expected, actual, dt, desiredRate);
+
+      if (res.action === "SEEK") {
         guardRef.current = true;
         videoEl.currentTime = expected;
+        videoEl.playbackRate = desiredRate;
         queueMicrotask(() => { guardRef.current = false; });
-      } else if (delta < -0.1) {
-        videoEl.playbackRate = Math.max((playback.playbackRate || 1) * 1.05, 0.1);
-      } else if (delta > 0.1) {
-        videoEl.playbackRate = Math.max((playback.playbackRate || 1) * 0.95, 0.1);
+      } else if (res.action === "SLEW") {
+        videoEl.playbackRate = res.slewRate;
       } else {
-        videoEl.playbackRate = playback.playbackRate || 1;
+        if (Math.abs(videoEl.playbackRate - desiredRate) > 0.001) {
+          videoEl.playbackRate = desiredRate;
+        }
       }
-    }, 2000);
+    }, 500);
 
     return () => clearInterval(id);
   }, [videoRef, playback, clockOffset]);

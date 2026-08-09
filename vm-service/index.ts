@@ -1,43 +1,257 @@
 /**
  * Virtual Browser Service for WatchParty
  * ---------------------------------------
- * Runs on port 3004. Uses puppeteer-core to control the user's existing
- * Chrome installation, streams screenshots as MJPEG over HTTP, and accepts
- * mouse/keyboard input over WebSocket.
+ * Runs on port 3004. Uses puppeteer-core to control the user's Chrome installation,
+ * streams screenshots as MJPEG over HTTP, and accepts mouse/keyboard input over WebSocket.
  *
- * Works through Cloudflare Tunnel (HTTP + WebSocket, no UDP/WebRTC needed).
- *
- * Usage: bun run dev  (or node index.js)
- * Access: http://localhost:3004 or https://vm.kushalneedsmcp.online
+ * Implements M3 requirements:
+ * - Server-side mutex floor control queue state machine
+ * - Single-writer security invariant for remote input
+ * - Remote input unit vector normalization
+ * - URL sanitization & CDP frame navigation event pushing
+ * - Low-RAM dynamic Chrome launching
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
-import { join } from "path";
 
 const PORT = 3004;
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const DEFAULT_CHROME_PATH =
+  process.platform === "win32"
+    ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    : "/usr/bin/chromium";
+
+const CHROME_PATH = process.env.CHROME_PATH || DEFAULT_CHROME_PATH;
+const IS_HEADLESS = process.env.HEADLESS !== "false";
 const WIDTH = 1920;
 const HEIGHT = 1080;
 const FPS = 15; // screenshots per second
 const JPEG_QUALITY = 70;
 
-// ─── State ───
+// ─── Exportable Helpers & State Machine for Testing & Core Execution ───
+
+export interface QueuedUser {
+  userId: string;
+  userName: string;
+  socket: WebSocket;
+}
+
+export interface ControlState {
+  controllerId: string | null;
+  controllerName?: string | null;
+  queue: Array<{ userId: string; userName: string }>;
+}
+
+export class FloorControlManager {
+  private state: "IDLE" | "OCCUPIED" = "IDLE";
+  private activeControllerId: string | null = null;
+  private activeControllerName: string | null = null;
+  private activeControllerSocket: WebSocket | null = null;
+  private controlQueue: QueuedUser[] = [];
+
+  getState(): "IDLE" | "OCCUPIED" {
+    return this.state;
+  }
+
+  getActiveControllerId(): string | null {
+    return this.activeControllerId;
+  }
+
+  getActiveControllerSocket(): WebSocket | null {
+    return this.activeControllerSocket;
+  }
+
+  getControlState(): ControlState {
+    return {
+      controllerId: this.activeControllerId,
+      controllerName: this.activeControllerName,
+      queue: this.controlQueue.map((q) => ({ userId: q.userId, userName: q.userName })),
+    };
+  }
+
+  isController(socket: WebSocket): boolean {
+    return this.state === "OCCUPIED" && this.activeControllerSocket === socket;
+  }
+
+  requestControl(userId: string, userName: string, socket: WebSocket) {
+    if (this.state === "IDLE") {
+      this.state = "OCCUPIED";
+      this.activeControllerId = userId;
+      this.activeControllerName = userName;
+      this.activeControllerSocket = socket;
+      return { status: "granted", controllerId: userId, controllerName: userName };
+    } else {
+      if (this.activeControllerId === userId) {
+        this.activeControllerSocket = socket;
+        return { status: "already_controller", controllerId: userId };
+      }
+      const existingIdx = this.controlQueue.findIndex((q) => q.userId === userId);
+      if (existingIdx >= 0) {
+        this.controlQueue[existingIdx].socket = socket;
+        this.controlQueue[existingIdx].userName = userName;
+        return { status: "queued", position: existingIdx + 1 };
+      }
+      this.controlQueue.push({ userId, userName, socket });
+      return { status: "queued", position: this.controlQueue.length };
+    }
+  }
+
+  releaseControl(userId: string, requestingSocket?: WebSocket) {
+    if (this.activeControllerId === userId) {
+      if (requestingSocket && this.activeControllerSocket !== requestingSocket) {
+        return { status: "unauthorized" };
+      }
+      if (this.controlQueue.length > 0) {
+        const next = this.controlQueue.shift()!;
+        this.activeControllerId = next.userId;
+        this.activeControllerName = next.userName;
+        this.activeControllerSocket = next.socket;
+        return {
+          status: "promoted",
+          nextControllerId: next.userId,
+          nextControllerName: next.userName,
+          nextSocket: next.socket,
+        };
+      } else {
+        this.state = "IDLE";
+        this.activeControllerId = null;
+        this.activeControllerName = null;
+        this.activeControllerSocket = null;
+        return { status: "idle" };
+      }
+    } else {
+      const queuedItem = this.controlQueue.find((q) => q.userId === userId);
+      if (queuedItem) {
+        if (requestingSocket && queuedItem.socket !== requestingSocket) {
+          return { status: "unauthorized" };
+        }
+        this.controlQueue = this.controlQueue.filter((q) => q.userId !== userId);
+        return { status: "removed_from_queue" };
+      }
+      return { status: "not_found" };
+    }
+  }
+
+  revokeControl(targetUserId: string) {
+    if (this.activeControllerId === targetUserId) {
+      return this.releaseControl(targetUserId);
+    } else {
+      this.controlQueue = this.controlQueue.filter((q) => q.userId !== targetUserId);
+      return { status: "revoked_from_queue" };
+    }
+  }
+
+  handleDisconnect(socket: WebSocket) {
+    if (this.activeControllerSocket === socket) {
+      return this.releaseControl(this.activeControllerId!);
+    } else {
+      this.controlQueue = this.controlQueue.filter((q) => q.socket !== socket);
+      return { status: "queue_updated" };
+    }
+  }
+}
+
+export function sanitizeUnit(v: number): number {
+  if (typeof v !== "number" || Number.isNaN(v)) return 0;
+  return Math.min(1, Math.max(0, v));
+}
+
+export function normalizeCoordinates(
+  xNorm: number,
+  yNorm: number,
+  width: number = WIDTH,
+  height: number = HEIGHT
+): { x: number; y: number } {
+  const clampedX = sanitizeUnit(xNorm);
+  const clampedY = sanitizeUnit(yNorm);
+  const x = Math.min(width - 1, Math.max(0, Math.floor(clampedX * width)));
+  const y = Math.min(height - 1, Math.max(0, Math.floor(clampedY * height)));
+  return { x, y };
+}
+
+export function sanitizeUrl(inputUrl: string): string {
+  const trimmed = (inputUrl || "").trim();
+  if (!trimmed) {
+    throw new Error("URL string cannot be empty");
+  }
+
+  const lower = trimmed.toLowerCase();
+  const forbiddenSchemes = ["file:", "chrome:", "chrome-extension:", "javascript:", "data:", "about:"];
+  for (const scheme of forbiddenSchemes) {
+    if (lower.startsWith(scheme)) {
+      throw new Error(`Forbidden URL scheme: ${scheme}`);
+    }
+  }
+
+  let formatted = trimmed;
+  if (!/^https?:\/\//i.test(formatted)) {
+    formatted = `https://${formatted}`;
+  }
+
+  try {
+    const parsed = new URL(formatted);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("Only HTTP and HTTPS protocols are allowed");
+    }
+    return parsed.toString();
+  } catch (err) {
+    throw new Error(`Invalid URL format: ${(err as Error).message}`);
+  }
+}
+
+// ─── Service State ───
 let browser: Browser | null = null;
 let page: Page | null = null;
 let lastFrame: Buffer | null = null;
 let capturing = false;
 
-// Connected WS clients (for input + frame distribution)
 const clients = new Set<WebSocket>();
+const floorManager = new FloorControlManager();
 
-// ─── Browser launch ───
+function broadcastControlState() {
+  const state = floorManager.getControlState();
+  const msg = Buffer.concat([
+    Buffer.from([129]),
+    Buffer.from(JSON.stringify(state)),
+  ]);
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  }
+}
+
+function broadcastGrantControl(controllerId: string | null, controllerName?: string | null) {
+  const msg = Buffer.concat([
+    Buffer.from([128]),
+    Buffer.from(JSON.stringify({ controllerId, controllerName })),
+  ]);
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  }
+}
+
+function broadcastUrl(currentUrl: string) {
+  const msg = Buffer.concat([
+    Buffer.from([12]), // Type 12 (0x0C): Push URL change
+    Buffer.from(JSON.stringify({ url: currentUrl })),
+  ]);
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(msg);
+    }
+  }
+}
+
+// ─── Browser Launch ───
 async function launchBrowser() {
-  console.log("[vm] Launching Chrome…");
+  console.log(`[vm] Launching Chrome via executable: ${CHROME_PATH} (Headless: ${IS_HEADLESS})…`);
   browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
-    headless: false,
+    headless: IS_HEADLESS ? ("shell" as any) : false,
     args: [
       `--window-size=${WIDTH},${HEIGHT}`,
       "--no-sandbox",
@@ -46,7 +260,8 @@ async function launchBrowser() {
       "--disable-dev-shm-usage",
       "--mute-audio",
       "--autoplay-policy=no-user-gesture-required",
-      // Stealth: avoid headless detection by Cloudflare/bot protection
+      "--renderer-process-limit=2",
+      '--js-flags="--max-old-space-size=512"',
       "--disable-blink-features=AutomationControlled",
       "--exclude-switches=enable-automation",
       "--disable-features=IsolateOrigins,site-per-process",
@@ -59,25 +274,23 @@ async function launchBrowser() {
   page = (await browser.pages())[0] || (await browser.newPage());
   await page.setViewport({ width: WIDTH, height: HEIGHT });
 
-  // Remove webdriver property to avoid detection
+  // CDP frame navigation push listener
+  page.on("framenavigated", (frame) => {
+    if (page && frame === page.mainFrame()) {
+      broadcastUrl(page.url());
+    }
+  });
+
+  // Stealth: avoid headless detection
   await page.evaluateOnNewDocument(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    // Overwrite the `plugins` property to use a custom getter.
-    Object.defineProperty(navigator, "plugins", {
-      get: () => [1, 2, 3, 4, 5],
-    });
-    // Overwrite the `languages` property to use a custom getter.
-    Object.defineProperty(navigator, "languages", {
-      get: () => ["en-US", "en"],
-    });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
   }).catch(() => {});
 
-  // Navigate to a default page
   await page.goto("https://www.google.com", { waitUntil: "domcontentloaded" }).catch(() => {});
-
   console.log("[vm] Chrome launched, starting capture loop");
 
-  // Screenshot capture loop
   capturing = true;
   const captureLoop = async () => {
     while (capturing && page) {
@@ -88,18 +301,14 @@ async function launchBrowser() {
           clip: { x: 0, y: 0, width: WIDTH, height: HEIGHT },
         });
         lastFrame = frame as Buffer;
-        // Broadcast to all WS clients
-        const msg = Buffer.concat([
-          Buffer.from([1]), // type=1 (frame)
-          lastFrame,
-        ]);
+        const msg = Buffer.concat([Buffer.from([1]), lastFrame]);
         for (const ws of clients) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(msg);
           }
         }
       } catch (e) {
-        // Page might be navigating, skip this frame
+        // Page might be navigating
       }
       await new Promise((r) => setTimeout(r, 1000 / FPS));
     }
@@ -107,22 +316,19 @@ async function launchBrowser() {
   captureLoop();
 }
 
-// ─── HTTP server (MJPEG stream + web UI) ───
+// ─── HTTP Server ───
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
-  // CORS + no-cache headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
 
-  // Health check
   if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, service: "vm-browser", clients: clients.size }));
     return;
   }
 
-  // MJPEG stream endpoint (fallback for non-WS clients)
   if (url.pathname === "/stream") {
     res.writeHead(200, {
       "Content-Type": "multipart/x-mixed-replace; boundary=frame",
@@ -139,7 +345,6 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     return;
   }
 
-  // Get current URL
   if (url.pathname === "/url") {
     const currentUrl = page?.url() || "";
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -147,7 +352,6 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     return;
   }
 
-  // Navigate to a new URL (POST)
   if (url.pathname === "/navigate" && req.method === "POST") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -155,7 +359,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       try {
         const { url: navUrl } = JSON.parse(body);
         if (navUrl && page) {
-          await page.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+          const validUrl = sanitizeUrl(navUrl);
+          await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, url: page.url() }));
         } else {
@@ -163,14 +368,13 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
           res.end(JSON.stringify({ ok: false, error: "Missing url" }));
         }
       } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ ok: false, error: String(e) }));
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: String((e as Error).message || e) }));
       }
     });
     return;
   }
 
-  // Serve the web UI (HTML page with canvas + input handlers)
   if (url.pathname === "/" || url.pathname === "/index.html") {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(HTML_UI);
@@ -181,66 +385,158 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
   res.end("Not found");
 });
 
-// ─── WebSocket server (input + frame streaming) ───
+// ─── WebSocket Server ───
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (ws: WebSocket) => {
   clients.add(ws);
   console.log(`[vm] WS client connected (${clients.size} total)`);
 
-  // Send the latest frame immediately
   if (lastFrame) {
     ws.send(Buffer.concat([Buffer.from([1]), lastFrame]));
   }
 
+  // Send current floor state upon connection
+  const currentState = floorManager.getControlState();
+  ws.send(Buffer.concat([Buffer.from([129]), Buffer.from(JSON.stringify(currentState))]));
+
   ws.on("message", async (data: Buffer) => {
     if (!page) return;
     try {
-      const type = data[0]; // message type
-      const payload = data.slice(1).toString("utf-8");
+      const type = data[0];
+      const payloadStr = data.length > 1 ? data.slice(1).toString("utf-8") : "";
+      let payload: any = {};
+      if (payloadStr) {
+        try {
+          payload = JSON.parse(payloadStr);
+        } catch (e) {}
+      }
+
+      // Floor Control Messages
+      if (type === 16) {
+        // request-control
+        const { userId, userName } = payload;
+        const res = floorManager.requestControl(userId, userName || "User", ws);
+        if (res.status === "granted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: userId, controllerName: userName })),
+          ]);
+          ws.send(grantMsg);
+        }
+        broadcastControlState();
+        return;
+      } else if (type === 17) {
+        // release-control
+        const { userId } = payload;
+        const res = floorManager.releaseControl(userId, ws);
+        if (res.status === "unauthorized") {
+          return;
+        }
+        if (res.status === "promoted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+          ]);
+          if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+            res.nextSocket.send(grantMsg);
+          }
+        } else if (res.status === "idle") {
+          broadcastGrantControl(null);
+        }
+        broadcastControlState();
+        return;
+      } else if (type === 18) {
+        // revoke-control
+        const { targetUserId } = payload;
+        const res = floorManager.revokeControl(targetUserId);
+        if (res.status === "promoted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+          ]);
+          if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+            res.nextSocket.send(grantMsg);
+          }
+        } else if (res.status === "idle") {
+          broadcastGrantControl(null);
+        }
+        broadcastControlState();
+        return;
+      }
+
+      // Single-Writer Security Invariant: reject input events if not current active controller
+      if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(type)) {
+        if (!floorManager.isController(ws)) {
+          // Reject unauthorized input event frame
+          return;
+        }
+      }
 
       if (type === 2) {
         // Mouse move
-        const { x, y } = JSON.parse(payload);
-        await page.mouse.move(x, y);
+        const xNorm = payload.xNorm !== undefined ? payload.xNorm : payload.x;
+        const yNorm = payload.yNorm !== undefined ? payload.yNorm : payload.y;
+        if (xNorm !== undefined && yNorm !== undefined) {
+          const { x, y } = normalizeCoordinates(xNorm, yNorm, WIDTH, HEIGHT);
+          await page.mouse.move(x, y);
+        }
       } else if (type === 3) {
         // Mouse click
-        const { x, y, button } = JSON.parse(payload);
-        await page.mouse.click(x, y, { button: button || "left" });
+        const xNorm = payload.xNorm !== undefined ? payload.xNorm : payload.x;
+        const yNorm = payload.yNorm !== undefined ? payload.yNorm : payload.y;
+        if (xNorm !== undefined && yNorm !== undefined) {
+          const { x, y } = normalizeCoordinates(xNorm, yNorm, WIDTH, HEIGHT);
+          await page.mouse.click(x, y, { button: payload.button || "left" });
+        }
       } else if (type === 4) {
         // Mouse scroll
-        const { deltaX, deltaY } = JSON.parse(payload);
-        await page.mouse.wheel({ deltaX, deltaY });
+        const { deltaX, deltaY } = payload;
+        await page.mouse.wheel({ deltaX: deltaX || 0, deltaY: deltaY || 0 });
       } else if (type === 5) {
-        // Keyboard input
-        const { key } = JSON.parse(payload);
+        // Keyboard keydown
+        const { key } = payload;
         await page.keyboard.press(key);
       } else if (type === 6) {
         // Type text
-        const { text } = JSON.parse(payload);
+        const { text } = payload;
         await page.keyboard.type(text);
       } else if (type === 7) {
         // Navigate
-        const { url } = JSON.parse(payload);
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        const { url } = payload;
+        const validUrl = sanitizeUrl(url);
+        await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
       } else if (type === 8) {
-        // Go back
         await page.goBack();
       } else if (type === 9) {
-        // Go forward
         await page.goForward();
       } else if (type === 10) {
-        // Reload
         await page.reload();
+      } else if (type === 11) {
+        const { script } = payload;
+        await page.evaluate(script).catch(() => {});
       }
     } catch (e) {
-      // Ignore input errors (page might be navigating)
+      // Ignore input errors
     }
   });
 
   ws.on("close", () => {
     clients.delete(ws);
     console.log(`[vm] WS client disconnected (${clients.size} total)`);
+    const res = floorManager.handleDisconnect(ws);
+    if (res?.status === "promoted") {
+      const grantMsg = Buffer.concat([
+        Buffer.from([128]),
+        Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+      ]);
+      if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+        res.nextSocket.send(grantMsg);
+      }
+    } else if (res?.status === "idle") {
+      broadcastGrantControl(null);
+    }
+    broadcastControlState();
   });
 });
 
@@ -306,7 +602,6 @@ ws.onopen = () => { statusText.textContent = '1920×1080 · 15fps · connected';
 ws.onmessage = (e) => {
   const data = new Uint8Array(e.data);
   if (data[0] === 1) {
-    // Frame
     if (loading.style.display !== 'none') { loading.style.display = 'none'; canvas.style.display = 'block'; }
     const blob = new Blob([data.slice(1)], { type: 'image/jpeg' });
     const url = URL.createObjectURL(blob);
@@ -321,28 +616,34 @@ ws.onmessage = (e) => {
       if (now - lastFpsTime > 1000) { fps = frameCount; frameCount = 0; lastFpsTime = now; statusText.textContent = '1920×1080 · ' + fps + 'fps · live'; }
     };
     img.src = url;
+  } else if (data[0] === 12) {
+    try {
+      const payload = JSON.parse(new TextDecoder().decode(data.slice(1)));
+      if (payload.url && payload.url !== urlbar.value && document.activeElement !== urlbar) {
+        urlbar.value = payload.url;
+      }
+    } catch (err) {}
   }
 };
 
 ws.onclose = () => { loading.style.display = 'block'; loading.innerHTML = '<div class="spinner"></div>Reconnecting…'; canvas.style.display = 'none'; statusText.textContent = 'disconnected'; };
 ws.onerror = () => { loading.innerHTML = '<div class="spinner"></div>Connection error'; };
 
-// Mouse input — map screen coords to canvas coords
-function getCoords(e) {
+function getNormalizedCoords(e) {
   const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
-  return { x: Math.round(x), y: Math.round(y) };
+  const xNorm = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const yNorm = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+  return { xNorm, yNorm };
 }
 
 canvas.addEventListener('mousemove', (e) => {
-  const { x, y } = getCoords(e);
-  ws.send(new Uint8Array([2, ...new TextEncoder().encode(JSON.stringify({x, y}))]));
+  const { xNorm, yNorm } = getNormalizedCoords(e);
+  ws.send(new Uint8Array([2, ...new TextEncoder().encode(JSON.stringify({xNorm, yNorm}))]));
 });
 canvas.addEventListener('mousedown', (e) => {
-  const { x, y } = getCoords(e);
+  const { xNorm, yNorm } = getNormalizedCoords(e);
   const btn = e.button === 2 ? 'right' : 'left';
-  ws.send(new Uint8Array([3, ...new TextEncoder().encode(JSON.stringify({x, y, button: btn}))]));
+  ws.send(new Uint8Array([3, ...new TextEncoder().encode(JSON.stringify({xNorm, yNorm, button: btn}))]));
   e.preventDefault();
 });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -351,16 +652,14 @@ canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
 }, { passive: false });
 
-// Keyboard input
 document.addEventListener('keydown', (e) => {
   if (document.activeElement === urlbar) return;
   ws.send(new Uint8Array([5, ...new TextEncoder().encode(JSON.stringify({key: e.key}))]));
   if (e.key.length === 1 || ['Backspace','Tab','Enter','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
 });
 
-// Navigation
 function navigate(url) {
-  url = url.trim();
+  url = (url || '').trim();
   if (!url) return;
   if (!url.match(/^https?:\\/\\//)) url = 'https://' + url;
   urlbar.value = url;
@@ -370,32 +669,27 @@ function goBack() { ws.send(new Uint8Array([8])); }
 function goFwd() { ws.send(new Uint8Array([9])); }
 function reload() { ws.send(new Uint8Array([10])); }
 function goHome() { navigate('https://www.google.com'); }
-
-// Update URL bar when page changes
-setInterval(() => {
-  if (ws.readyState === 1) {
-    fetch('/url').then(r => r.json()).then(d => { if (d.url && d.url !== urlbar.value && document.activeElement !== urlbar) urlbar.value = d.url; }).catch(() => {});
-  }
-}, 3000);
 </script>
 </body>
 </html>`;
 
-// ─── Start ───
-server.listen(PORT, async () => {
-  console.log(`[vm] HTTP server on port ${PORT}`);
-  try {
-    await launchBrowser();
-    console.log(`[vm] Virtual browser ready at http://localhost:${PORT}`);
-  } catch (e) {
-    console.error("[vm] Failed to launch Chrome:", e);
-    console.error("[vm] Make sure Chrome is installed at:", CHROME_PATH);
-  }
-});
+// ─── Start Server (Only if not in test environment and run as main entry point) ───
+if (process.env.NODE_ENV !== "test" && process.argv[1] && (process.argv[1].endsWith("index.ts") || process.argv[1].endsWith("index.js"))) {
+  server.listen(PORT, async () => {
+    console.log(`[vm] HTTP server on port ${PORT}`);
+    try {
+      await launchBrowser();
+      console.log(`[vm] Virtual browser ready at http://localhost:${PORT}`);
+    } catch (e) {
+      console.error("[vm] Failed to launch Chrome:", e);
+      console.error("[vm] Make sure Chrome is installed at:", CHROME_PATH);
+    }
+  });
+}
 
-// Graceful shutdown
 process.on("SIGINT", async () => {
   capturing = false;
   if (browser) await browser.close();
   process.exit(0);
 });
+

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import Hls from "hls.js";
 import { PlaybackState, detectVideoType, youtubeId } from "@/lib/sync/types";
 import { useVideoController } from "@/lib/sync/use-video-controller";
+import { PISlewingController } from "@/lib/sync/pi-controller";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import {
@@ -78,7 +79,6 @@ export function UniversalPlayer({
     if (videoType !== "hls") return;
     const v = videoRef.current;
     if (!v || !videoUrl) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setReady(false);
 
@@ -113,7 +113,6 @@ export function UniversalPlayer({
     if (!["mp4", "webm", "ogg"].includes(videoType)) return;
     const v = videoRef.current;
     if (!v || !videoUrl) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setReady(false);
     v.src = videoUrl;
@@ -206,7 +205,6 @@ export function UniversalPlayer({
   }, [playback?.isPlaying]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     pokeControls();
   }, [pokeControls, playback?.isPlaying]);
 
@@ -403,12 +401,13 @@ function YouTubePlayer({
   const containerId = useRef(`yt-${Math.random().toString(36).slice(2, 8)}`).current;
   const playerRef = useRef<YT.Player | null>(null);
   const guardRef = useRef(false);
+  const piControllerRef = useRef(new PISlewingController());
   const lastSeq = useRef(-1);
+  const lastTickTimeRef = useRef<number>(Date.now());
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Keep latest playback + clockOffset in refs so onReady can access them
-  // without being stale (the effect only re-runs on videoId change).
   const latestPlayback = useRef(playback);
   const latestClockOffset = useRef(clockOffset);
   latestPlayback.current = playback;
@@ -417,11 +416,9 @@ function YouTubePlayer({
   // Load YouTube IFrame API once.
   useEffect(() => {
     if (window.YT && window.YT.Player) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setReady(true);
       return;
     }
-    // Defer script loading to avoid React 19 "script tag during render" error
     queueMicrotask(() => {
       const tag = document.createElement("script");
       tag.src = "https://www.youtube.com/iframe_api";
@@ -429,15 +426,11 @@ function YouTubePlayer({
       document.body.appendChild(tag);
       (window as any).onYouTubeIframeAPIReady = () => setReady(true);
     });
-    return () => {
-      // leave the global callback; other components might need it
-    };
   }, []);
 
   // Create / refresh player when videoId changes.
   useEffect(() => {
     if (!ready || !containerRef.current) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     guardRef.current = true;
 
@@ -463,15 +456,18 @@ function YouTubePlayer({
           try {
             const pb = latestPlayback.current;
             const co = latestClockOffset.current;
-            playerRef.current?.setPlaybackRate(pb.playbackRate || 1);
-            // CRITICAL: immediately sync to current room state so late
-            // joiners land on the same position as everyone else.
+            const desiredRate = pb.playbackRate || 1;
+            playerRef.current?.setPlaybackRate(desiredRate);
+
+            // CRITICAL: Frame-exact initial join synchronization
             const serverNow = Date.now() + co;
             const elapsed = pb.isPlaying
               ? (serverNow - pb.lastChangedAt) / 1000
               : 0;
-            const expectedTime = pb.currentTime + elapsed;
+            const expectedTime = pb.currentTime + elapsed * desiredRate;
             playerRef.current?.seekTo(expectedTime, true);
+            piControllerRef.current.reset();
+
             if (pb.isPlaying) {
               playerRef.current?.playVideo();
             } else {
@@ -490,9 +486,6 @@ function YouTubePlayer({
           } else if (e.data === window.YT.PlayerState.PAUSED) {
             onIntent({ isPlaying: false, currentTime: p.getCurrentTime() });
           }
-          // BUFFERING (state 3): don't broadcast — let the periodic
-          // drift correction handle re-sync when playback resumes.
-          // The server's heartbeat will keep everyone aligned.
         },
         onError: () => setError("YouTube video could not be loaded"),
       },
@@ -502,7 +495,7 @@ function YouTubePlayer({
       try { playerRef.current?.destroy(); } catch {}
       playerRef.current = null;
     };
-  }, [ready, videoId]);
+  }, [ready, videoId, onIntent]);
 
   // Apply authoritative state.
   useEffect(() => {
@@ -513,39 +506,64 @@ function YouTubePlayer({
     guardRef.current = true;
     const p = playerRef.current;
     const serverNow = Date.now() + clockOffset;
+    const desiredRate = playback.playbackRate || 1;
     const elapsed = playback.isPlaying ? (serverNow - playback.lastChangedAt) / 1000 : 0;
-    const expected = playback.currentTime + elapsed;
+    const expected = playback.currentTime + elapsed * desiredRate;
 
     try {
       const actual = p.getCurrentTime();
-      if (Math.abs(actual - expected) > 1.0) {
+      const delta = Math.abs(actual - expected);
+      if (delta > 1.0) {
         p.seekTo(expected, true);
+        p.setPlaybackRate(desiredRate);
+        piControllerRef.current.reset();
+      } else {
+        const res = piControllerRef.current.compute(expected, actual, 0.5, desiredRate);
+        if (res.action === "SLEW") {
+          p.setPlaybackRate(res.slewRate);
+        } else {
+          p.setPlaybackRate(desiredRate);
+        }
       }
-      p.setPlaybackRate(playback.playbackRate || 1);
       if (playback.isPlaying) p.playVideo();
       else p.pauseVideo();
     } catch {}
     queueMicrotask(() => { guardRef.current = false; });
   }, [playback, clockOffset, ready]);
 
-  // Periodic drift check.
+  // Periodic PI drift correction ticker (500ms).
   useEffect(() => {
     if (!ready) return;
+    lastTickTimeRef.current = Date.now();
+
     const id = setInterval(() => {
       const p = playerRef.current;
       if (!p || guardRef.current || !playback.isPlaying) return;
       try {
-        const serverNow = Date.now() + clockOffset;
+        const now = Date.now();
+        const dt = (now - lastTickTimeRef.current) / 1000;
+        lastTickTimeRef.current = now;
+
+        const serverNow = now + clockOffset;
         const elapsed = (serverNow - playback.lastChangedAt) / 1000;
-        const expected = playback.currentTime + elapsed * (playback.playbackRate || 1);
+        const desiredRate = playback.playbackRate || 1;
+        const expected = playback.currentTime + elapsed * desiredRate;
         const actual = p.getCurrentTime();
-        if (Math.abs(actual - expected) > 1.5) {
+
+        const res = piControllerRef.current.compute(expected, actual, dt, desiredRate);
+
+        if (res.action === "SEEK") {
           guardRef.current = true;
           p.seekTo(expected, true);
+          p.setPlaybackRate(desiredRate);
           queueMicrotask(() => { guardRef.current = false; });
+        } else if (res.action === "SLEW") {
+          p.setPlaybackRate(res.slewRate);
+        } else {
+          p.setPlaybackRate(desiredRate);
         }
       } catch {}
-    }, 2000);
+    }, 500);
     return () => clearInterval(id);
   }, [ready, playback, clockOffset]);
 
@@ -590,4 +608,10 @@ declare global {
     YT: any;
     onYouTubeIframeAPIReady?: () => void;
   }
+  /* eslint-disable @typescript-eslint/no-namespace */
+  namespace YT {
+    type Player = any;
+    type OnStateChangeEvent = any;
+  }
+  /* eslint-enable @typescript-eslint/no-namespace */
 }

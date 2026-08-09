@@ -16,10 +16,16 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
-import { join } from "path";
+import { FloorControlManager, normalizeCoordinates } from "./index";
 
 const PORT = 3004;
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const DEFAULT_CHROME_PATH =
+  process.platform === "win32"
+    ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    : "/usr/bin/chromium";
+
+const CHROME_PATH = process.env.CHROME_PATH || DEFAULT_CHROME_PATH;
+const IS_HEADLESS = process.env.HEADLESS !== "false";
 const WIDTH = 1600;
 const HEIGHT = 900;
 const FPS = 24;
@@ -31,10 +37,36 @@ let page: Page | null = null;
 let lastFrame: Buffer | null = null;
 let capturing = false;
 const clients = new Set<WebSocket>();
+const floorManager = new FloorControlManager();
+
+function broadcastControlState() {
+  const state = floorManager.getControlState();
+  const msg = Buffer.concat([
+    Buffer.from([129]),
+    Buffer.from(JSON.stringify(state)),
+  ]);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+function broadcastGrantControl(controllerId: string | null) {
+  const msg = Buffer.concat([
+    Buffer.from([128]),
+    Buffer.from(JSON.stringify({ controllerId })),
+  ]);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
 
 // ─── Browser launch ───
 async function launchBrowser() {
-  console.log("[vm] Launching dedicated Chrome…");
+  console.log(`[vm] Launching dedicated Chrome via executable: ${CHROME_PATH} (Headless: ${IS_HEADLESS})…`);
 
   // Use a dedicated user-data-dir so this Chrome is completely separate
   // from the user's personal Chrome — no cookies, no history, no tabs.
@@ -42,7 +74,7 @@ async function launchBrowser() {
 
   browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
-    headless: false, // Must be non-headless for anti-bot detection
+    headless: IS_HEADLESS ? ("shell" as any) : false,
     userDataDir,
     args: [
       `--window-size=${WIDTH},${HEIGHT}`,
@@ -185,45 +217,117 @@ wss.on("connection", (ws: WebSocket) => {
     if (!page) return;
     try {
       const type = data[0];
-      const payload = data.slice(1).toString("utf-8");
+      const payloadStr = data.length > 1 ? data.slice(1).toString("utf-8") : "";
+      let payload: any = {};
+      if (payloadStr) {
+        try {
+          payload = JSON.parse(payloadStr);
+        } catch (e) {}
+      }
+
+      // Floor Control Messages
+      if (type === 16) {
+        // request-control
+        const { userId, userName } = payload;
+        const res = floorManager.requestControl(userId, userName || "User", ws);
+        if (res.status === "granted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: userId, controllerName: userName })),
+          ]);
+          ws.send(grantMsg);
+        }
+        broadcastControlState();
+        return;
+      } else if (type === 17) {
+        // release-control
+        const { userId } = payload;
+        const res = floorManager.releaseControl(userId);
+        if (res.status === "promoted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+          ]);
+          if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+            res.nextSocket.send(grantMsg);
+          }
+        } else if (res.status === "idle") {
+          broadcastGrantControl(null);
+        }
+        broadcastControlState();
+        return;
+      } else if (type === 18) {
+        // revoke-control
+        const { targetUserId } = payload;
+        const res = floorManager.revokeControl(targetUserId);
+        if (res.status === "promoted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+          ]);
+          if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+            res.nextSocket.send(grantMsg);
+          }
+        } else if (res.status === "idle") {
+          broadcastGrantControl(null);
+        }
+        broadcastControlState();
+        return;
+      }
+
+      // Single-Writer Security Invariant: reject input events if not current active controller
+      if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(type)) {
+        if (!floorManager.isController(ws)) {
+          return;
+        }
+      }
 
       if (type === 2) { // Mouse move
-        const { x, y } = JSON.parse(payload);
-        await page.mouse.move(x, y);
+        const xNorm = payload.xNorm !== undefined ? payload.xNorm : (payload.x > 1 ? payload.x / WIDTH : payload.x);
+        const yNorm = payload.yNorm !== undefined ? payload.yNorm : (payload.y > 1 ? payload.y / HEIGHT : payload.y);
+        if (xNorm !== undefined && yNorm !== undefined) {
+          const { x, y } = normalizeCoordinates(xNorm, yNorm, WIDTH, HEIGHT);
+          await page.mouse.move(x, y);
+        }
       } else if (type === 3) { // Mouse click
-        const { x, y, button } = JSON.parse(payload);
-        await page.mouse.click(x, y, { button: button || "left" });
+        const xNorm = payload.xNorm !== undefined ? payload.xNorm : (payload.x > 1 ? payload.x / WIDTH : payload.x);
+        const yNorm = payload.yNorm !== undefined ? payload.yNorm : (payload.y > 1 ? payload.y / HEIGHT : payload.y);
+        if (xNorm !== undefined && yNorm !== undefined) {
+          const { x, y } = normalizeCoordinates(xNorm, yNorm, WIDTH, HEIGHT);
+          await page.mouse.click(x, y, { button: payload.button || "left" });
+        }
       } else if (type === 4) { // Scroll
-        const { deltaX, deltaY } = JSON.parse(payload);
-        await page.mouse.wheel({ deltaX, deltaY });
+        const { deltaX, deltaY } = payload;
+        await page.mouse.wheel({ deltaX: deltaX || 0, deltaY: deltaY || 0 });
       } else if (type === 5) { // Key press
-        const { key } = JSON.parse(payload);
+        const { key } = payload;
         console.log("[vm] key received:", key, "page exists:", !!page);
-        // For single characters, use type() which sends keydown+keypress+input+keyup
-        if (key.length === 1) {
+        if (key && key.length === 1) {
           await page.keyboard.type(key);
           console.log("[vm] typed:", key);
-        } else {
+        } else if (key) {
           await page.keyboard.press(key);
           console.log("[vm] pressed:", key);
         }
       } else if (type === 6) { // Type text
-        const { text } = JSON.parse(payload);
-        await page.keyboard.type(text);
+        const { text } = payload;
+        if (text) await page.keyboard.type(text);
       } else if (type === 7) { // Navigate
-        const { url } = JSON.parse(payload);
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+        const { url } = payload;
+        if (url) await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
       } else if (type === 8) { await page.goBack(); }
       else if (type === 9) { await page.goForward(); }
       else if (type === 10) { await page.reload(); }
       else if (type === 11) { // Evaluate JS on page
-        const { script } = JSON.parse(payload);
-        await page.evaluate(script).catch((e: Error) => console.log("[vm] eval error:", e.message));
+        const { script } = payload;
+        if (script) await page.evaluate(script).catch((e: Error) => console.log("[vm] eval error:", e.message));
       }
     } catch (e) {}
   });
 
   ws.on("close", () => {
+    floorManager.handleDisconnect(ws);
+    broadcastControlState();
     clients.delete(ws);
     console.log(`[vm] WS client disconnected (${clients.size} total)`);
   });
