@@ -2,8 +2,6 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
 import {
   Loader2,
   Maximize,
@@ -13,37 +11,11 @@ import {
   Unlock,
   Hand,
   Users,
+  ArrowLeft,
+  ArrowRight,
+  RotateCw,
+  Home,
 } from "lucide-react";
-
-// Load noVNC RFB from CDN via ES module script tag.
-// @novnc/novnc 1.7.0 has core/rfb.js as an ES module with `export default`.
-// We load it via a module script and capture the RFB class via a global hook.
-let rfbPromise: Promise<any> | null = null;
-async function getRFB(): Promise<any> {
-  if (typeof window === "undefined") return null;
-  const w = window as any;
-  if (w.__RFB) return w.__RFB;
-  if (!rfbPromise) {
-    rfbPromise = new Promise((resolve, reject) => {
-      const hook = "__novnc_rfb_load_" + Date.now();
-      w[hook] = (RFB: any) => {
-        w.__RFB = RFB;
-        delete w[hook];
-        resolve(RFB);
-      };
-      const s = document.createElement("script");
-      s.type = "module";
-      s.textContent = 'import RFB from "https://cdn.jsdelivr.net/npm/@novnc/novnc@1.7.0/core/rfb.js"; window.' + hook + '(RFB);';
-      s.onerror = () => reject(new Error("Failed to load noVNC module"));
-      document.head.appendChild(s);
-      setTimeout(() => {
-        reject(new Error("noVNC load timeout (15s)"));
-        delete w[hook];
-      }, 15000);
-    });
-  }
-  return rfbPromise;
-}
 
 interface VirtualBrowserProps {
   vmUrl: string;
@@ -51,7 +23,6 @@ interface VirtualBrowserProps {
   userName: string;
   userColor: string;
   userId: string;
-  // Cursor + control from sync engine
   remoteCursors: Array<{ userId: string; name: string; color: string; x: number; y: number }>;
   controllerId: string | null;
   controlQueue: string[];
@@ -62,7 +33,6 @@ interface VirtualBrowserProps {
 
 export function VirtualBrowser({
   vmUrl,
-  password,
   userName,
   userColor,
   userId,
@@ -73,146 +43,184 @@ export function VirtualBrowser({
   onRequestControl,
   onReleaseControl,
 }: VirtualBrowserProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const rfbRef = useRef<RFB | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
-  const [hasControl, setHasControl] = useState(false);
+  const [fps, setFps] = useState(0);
+  const [urlBar, setUrlBar] = useState("");
 
   const isController = controllerId === userId;
-  const wsUrl = vmUrl.replace(/^http/, "ws") + "/websockify";
+  const wsUrl = vmUrl.replace(/^http/, "ws") + "/ws";
 
-  // Initialize noVNC RFB connection
+  // Connect to the VM Chrome service via WebSocket
   useEffect(() => {
     let cancelled = false;
+    let frameCount = 0;
+    let lastFpsTime = Date.now();
 
-    async function init() {
-      try {
-        const RFB = await getRFB();
+    setLoading(true);
+    setError(null);
 
-        if (cancelled || !containerRef.current) return;
+    const ws = new WebSocket(wsUrl);
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
 
-        // Clear previous connection
-        if (rfbRef.current) {
-          rfbRef.current.disconnect();
-          rfbRef.current = null;
-        }
+    ws.onopen = () => {
+      if (!cancelled) setLoading(false);
+    };
 
-        const rfb = new RFB(
-          containerRef.current,
-          wsUrl,
-          {
-            credentials: { password },
-            wsProtocols: ["binary"],
-          },
-        ) as RFB;
+    ws.onmessage = (e) => {
+      if (cancelled) return;
+      const data = new Uint8Array(e.data as ArrayBuffer);
+      if (data[0] === 1) {
+        // JPEG frame
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d", { alpha: false });
+        if (!ctx) return;
 
-        rfbRef.current = rfb;
+        const blob = new Blob([data.slice(1)], { type: "image/jpeg" });
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          if (canvas.width !== img.width) canvas.width = img.width;
+          if (canvas.height !== img.height) canvas.height = img.height;
+          ctx.drawImage(img, 0, 0);
+          URL.revokeObjectURL(url);
 
-        // Configure RFB — noVNC 1.7.0 uses property assignment, not set_* methods
-        rfb.scaleViewport = true;
-        rfb.showDotCursor = false;
-        rfb.resizeSession = true;
-
-        // Event listeners
-        const onConnect = () => {
-          if (!cancelled) {
-            setLoading(false);
-            setError(null);
+          // FPS counter
+          frameCount++;
+          const now = Date.now();
+          if (now - lastFpsTime > 1000) {
+            setFps(frameCount);
+            frameCount = 0;
+            lastFpsTime = now;
           }
         };
-
-        const onDisconnect = (e: { detail: { clean: boolean } }) => {
-          if (!cancelled) {
-            if (e.detail.clean) {
-              setLoading(true);
-            } else {
-              setError("Connection lost. Reconnecting…");
-              setLoading(true);
-            }
-          }
-        };
-
-        const onCredentialsRequired = () => {
-          rfb.sendCredentials({ password });
-        };
-
-        const onSecurityFailure = (e: { detail: { status: string; reason: string } }) => {
-          if (!cancelled) {
-            setError(`Authentication failed: ${e.detail.reason}`);
-            setLoading(false);
-          }
-        };
-
-        // noVNC uses custom events
-        rfb.addEventListener("connect", onConnect);
-        rfb.addEventListener("disconnect", onDisconnect);
-        rfb.addEventListener("credentialsrequired", onCredentialsRequired);
-        rfb.addEventListener("securityfailure", onSecurityFailure);
-
-        // Store cleanup
-        (rfb as any).__cleanup = () => {
-          rfb.removeEventListener("connect", onConnect);
-          rfb.removeEventListener("disconnect", onDisconnect);
-          rfb.removeEventListener("credentialsrequired", onCredentialsRequired);
-          rfb.removeEventListener("securityfailure", onSecurityFailure);
-        };
-      } catch (e) {
-        if (!cancelled) {
-          setError(`Failed to load noVNC: ${e instanceof Error ? e.message : String(e)}`);
-          setLoading(false);
-        }
+        img.src = url;
       }
-    }
+    };
 
-    init();
+    ws.onerror = () => {
+      if (!cancelled) {
+        setError("Connection error");
+        setLoading(false);
+      }
+    };
+
+    ws.onclose = () => {
+      if (!cancelled) {
+        setLoading(true);
+        setError(null);
+        // Auto-reconnect after 2s
+        setTimeout(() => {
+          if (!cancelled) {
+            wsRef.current = null;
+            // Trigger reconnect by re-running effect
+          }
+        }, 2000);
+      }
+    };
+
+    // Poll URL bar
+    const urlInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        fetch(`${vmUrl}/url`)
+          .then((r) => r.json())
+          .then((d) => {
+            if (d.url && d.url !== urlBar) setUrlBar(d.url);
+          })
+          .catch(() => {});
+      }
+    }, 3000);
 
     return () => {
       cancelled = true;
-      if (rfbRef.current) {
-        try {
-          (rfbRef.current as any).__cleanup?.();
-          rfbRef.current.disconnect();
-        } catch {}
-        rfbRef.current = null;
-      }
+      clearInterval(urlInterval);
+      ws.close();
+      wsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsUrl, password]);
+  }, [wsUrl]);
 
-  // Update control state
-  useEffect(() => {
-    setHasControl(isController);
-    if (isController && rfbRef.current) {
-      rfbRef.current.focus();
-    } else if (rfbRef.current) {
-      rfbRef.current.blur();
+  // Send mouse position to VM
+  const getCoords = (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.round((e.clientX - rect.left) * (canvas.width / rect.width)),
+      y: Math.round((e.clientY - rect.top) * (canvas.height / rect.height)),
+    };
+  };
+
+  const sendMsg = (type: number, payload: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        new Uint8Array([type, ...new TextEncoder().encode(JSON.stringify(payload))]),
+      );
     }
-  }, [isController]);
+  };
 
-  // Track local mouse position for cursor broadcast
   const onMouseMove = useCallback(
     (e: React.MouseEvent) => {
-      const rect = containerRef.current?.getBoundingClientRect();
-      if (!rect) return;
-      const x = (e.clientX - rect.left) / rect.width;
-      const y = (e.clientY - rect.top) / rect.height;
-      if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
-        onCursorMove(x, y);
+      if (!isController) return;
+      const c = getCoords(e);
+      if (c) {
+        sendMsg(2, c);
+        // Also broadcast to remote cursors
+        const rect = canvasRef.current?.getBoundingClientRect();
+        if (rect) {
+          onCursorMove((e.clientX - rect.left) / rect.width, (e.clientY - rect.top) / rect.height);
+        }
       }
     },
-    [onCursorMove],
+    [isController, onCursorMove],
   );
 
-  const toggleFullscreen = () => {
-    const el = containerRef.current?.parentElement;
-    if (!el) return;
-    if (!document.fullscreenElement) {
-      el.requestFullscreen?.().catch(() => {});
-    } else {
-      document.exitFullscreen?.().catch(() => {});
+  const onMouseDown = (e: React.MouseEvent) => {
+    if (!isController) return;
+    const c = getCoords(e);
+    if (c) sendMsg(3, { ...c, button: e.button === 2 ? "right" : "left" });
+    e.preventDefault();
+  };
+
+  const onWheel = (e: React.WheelEvent) => {
+    if (!isController) return;
+    sendMsg(4, { deltaX: e.deltaX, deltaY: e.deltaY });
+    e.preventDefault();
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (!isController) return;
+    if (document.activeElement?.tagName === "INPUT") return;
+    sendMsg(5, { key: e.key });
+    if (e.key.length === 1 || ["Backspace", "Tab", "Enter", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+      e.preventDefault();
     }
+  };
+
+  const navigate = (url: string) => {
+    url = url.trim();
+    if (!url) return;
+    if (!url.match(/^https?:\/\//)) url = "https://" + url;
+    setUrlBar(url);
+    sendMsg(7, { url });
+  };
+
+  const goBack = () => sendMsg(8, {});
+  const goFwd = () => sendMsg(9, {});
+  const reload = () => sendMsg(10, {});
+  const goHome = () => navigate("https://www.google.com");
+
+  const toggleFullscreen = () => {
+    const el = wrapRef.current;
+    if (!el) return;
+    if (!document.fullscreenElement) el.requestFullscreen?.().catch(() => {});
+    else document.exitFullscreen?.().catch(() => {});
   };
 
   useEffect(() => {
@@ -226,106 +234,93 @@ export function VirtualBrowser({
   return (
     <div className="relative flex h-full w-full flex-col bg-black">
       {/* Toolbar */}
-      <div className="flex shrink-0 items-center gap-1.5 border-b border-zinc-800 bg-zinc-900 px-2 py-1.5">
+      <div className="flex shrink-0 items-center gap-1 border-b border-zinc-800 bg-zinc-900 px-2 py-1.5">
         <Globe className="h-3.5 w-3.5 shrink-0 text-zinc-500" />
-        <span className="flex-1 truncate text-xs text-zinc-400">
-          {hasControl ? "You control — click inside to interact" : controllerId ? "Another user is controlling" : "Shared virtual browser"}
-        </span>
+        {isController ? (
+          <>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={goBack}>
+              <ArrowLeft className="h-3.5 w-3.5" />
+            </Button>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={goFwd}>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </Button>
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={reload}>
+              <RotateCw className="h-3.5 w-3.5" />
+            </Button>
+            <input
+              value={urlBar}
+              onChange={(e) => setUrlBar(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && navigate(urlBar)}
+              placeholder="Enter URL…"
+              className="flex-1 rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-violet-500"
+              spellCheck={false}
+            />
+            <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={goHome}>
+              <Home className="h-3.5 w-3.5" />
+            </Button>
+          </>
+        ) : (
+          <span className="flex-1 truncate text-xs text-zinc-500">
+            {controllerId ? "Another user is controlling" : "Shared virtual browser"}
+          </span>
+        )}
 
         {/* Control button */}
-        {hasControl ? (
-          <Button
-            size="sm"
-            variant="destructive"
-            className="h-7 gap-1 text-xs"
-            onClick={onReleaseControl}
-          >
+        {isController ? (
+          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={onReleaseControl}>
             <Unlock className="h-3 w-3" /> Release
           </Button>
         ) : controllerId ? (
           queuePosition >= 0 ? (
-            <Badge variant="secondary" className="h-7 gap-1 text-xs">
+            <span className="flex h-7 items-center gap-1 rounded-md bg-zinc-800 px-2 text-xs text-zinc-400">
               <Hand className="h-3 w-3" /> Queue #{queuePosition + 1}
-            </Badge>
+            </span>
           ) : (
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 gap-1 text-xs"
-              onClick={onRequestControl}
-            >
-              <Hand className="h-3 w-3" /> Request control
+            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
+              <Hand className="h-3 w-3" /> Request
             </Button>
           )
         ) : (
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 gap-1 text-xs"
-            onClick={onRequestControl}
-          >
+          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
             <Lock className="h-3 w-3" /> Take control
           </Button>
         )}
 
-        <Button
-          size="icon"
-          variant="ghost"
-          className="h-7 w-7 shrink-0 text-zinc-400 hover:bg-zinc-800 hover:text-white"
-          onClick={toggleFullscreen}
-        >
+        <Button size="sm" variant="ghost" className="h-7 w-7 p-0 text-zinc-400" onClick={toggleFullscreen}>
           {fullscreen ? <Minimize className="h-3.5 w-3.5" /> : <Maximize className="h-3.5 w-3.5" />}
         </Button>
       </div>
 
-      {/* noVNC canvas + cursor overlay */}
-      <div className="relative min-h-0 flex-1 bg-black">
-        {/* noVNC renders into this div */}
-        <div
-          ref={containerRef}
-          className="absolute inset-0"
+      {/* Canvas + cursor overlay */}
+      <div ref={wrapRef} className="relative min-h-0 flex-1 bg-black" tabIndex={0} onKeyDown={onKeyDown}>
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 h-full w-full object-contain"
+          style={{ pointerEvents: isController ? "auto" : "none", cursor: isController ? "crosshair" : "default" }}
           onMouseMove={onMouseMove}
-          style={{
-            pointerEvents: hasControl ? "auto" : "none",
-          }}
+          onMouseDown={onMouseDown}
+          onWheel={onWheel}
+          onContextMenu={(e) => e.preventDefault()}
         />
 
-        {/* Cursor overlay (pointer-events: none, always visible) */}
+        {/* Remote cursors overlay */}
         <div className="pointer-events-none absolute inset-0 z-10">
-          {/* Remote cursors */}
           {remoteCursors
             .filter((c) => c.userId !== userId)
             .map((c) => (
               <div
                 key={c.userId}
-                className="absolute flex items-center gap-1 transition-all duration-75"
-                style={{
-                  left: `${c.x * 100}%`,
-                  top: `${c.y * 100}%`,
-                  transform: "translate(-2px, -2px)",
-                }}
+                className="absolute transition-all duration-75"
+                style={{ left: `${c.x * 100}%`, top: `${c.y * 100}%`, transform: "translate(-2px,-2px)" }}
               >
-                {/* Cursor pointer SVG */}
                 <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                  <path
-                    d="M3 2L3 16L7 12L10 18L12 17L9 11L15 11L3 2Z"
-                    fill={c.color}
-                    stroke="white"
-                    strokeWidth="1.5"
-                    strokeLinejoin="round"
-                  />
+                  <path d="M3 2L3 16L7 12L10 18L12 17L9 11L15 11L3 2Z" fill={c.color} stroke="white" strokeWidth="1.5" strokeLinejoin="round" />
                 </svg>
-                {/* Name label */}
-                <span
-                  className="rounded-full px-1.5 py-0.5 text-[9px] font-bold text-white shadow-md"
-                  style={{ backgroundColor: c.color }}
-                >
+                <span className="ml-1 rounded-full px-1.5 py-0.5 text-[9px] font-bold text-white" style={{ backgroundColor: c.color }}>
                   {c.name.slice(0, 8)}
                 </span>
               </div>
             ))}
-
-          {/* Controller indicator */}
           {controllerId && controllerId !== userId && (
             <div className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-[10px] text-white/80 backdrop-blur">
               <Users className="mr-1 inline h-3 w-3" />
@@ -339,7 +334,6 @@ export function VirtualBrowser({
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-zinc-900">
             <Loader2 className="h-8 w-8 animate-spin text-violet-400" />
             <p className="text-sm text-zinc-400">Connecting to virtual browser…</p>
-            <p className="text-xs text-zinc-600">VNC via WebSocket · noVNC client</p>
           </div>
         )}
 
@@ -347,10 +341,7 @@ export function VirtualBrowser({
         {error && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-zinc-900 p-6 text-center">
             <p className="text-sm font-medium text-rose-400">{error}</p>
-            <p className="text-xs text-zinc-500">
-              Make sure the VNC server is running and accessible at{" "}
-              <code className="rounded bg-zinc-800 px-1 font-mono">{vmUrl}</code>
-            </p>
+            <p className="text-xs text-zinc-500">VM service at {vmUrl}</p>
           </div>
         )}
       </div>
@@ -362,18 +353,20 @@ export function VirtualBrowser({
           {loading ? "connecting" : "connected"}
         </span>
         <span className="text-zinc-700">·</span>
-        <span>1920×1080</span>
-        <span className="text-zinc-700">·</span>
-        <span>VNC over WebSocket</span>
-        {hasControl && (
+        <span>1280×720</span>
+        {fps > 0 && (
+          <>
+            <span className="text-zinc-700">·</span>
+            <span>{fps}fps</span>
+          </>
+        )}
+        {isController && (
           <>
             <span className="text-zinc-700">·</span>
             <span className="text-violet-400">● you control</span>
           </>
         )}
-        <span className="ml-auto">
-          {remoteCursors.length + 1} {remoteCursors.length + 1 === 1 ? "user" : "users"} online
-        </span>
+        <span className="ml-auto">{remoteCursors.length + 1} online</span>
       </div>
     </div>
   );
