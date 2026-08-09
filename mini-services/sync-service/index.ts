@@ -359,13 +359,13 @@ io.on("connection", (socket: Socket) => {
     if (!url) return;
     const type = detectVideoType(url);
     r.queue.push({ url, type, addedBy: me.userId, addedAt: Date.now() });
-    // If nothing is playing, auto-advance.
+    // If nothing is playing, auto-advance and auto-play.
     if (r.currentIndex < 0 || r.currentIndex >= r.queue.length) {
       r.currentIndex = r.queue.length - 1;
       r.playback.videoUrl = url;
       r.playback.videoType = type;
       r.playback.currentTime = 0;
-      r.playback.isPlaying = false;
+      r.playback.isPlaying = true;
       r.playback.lastChangedAt = Date.now();
       r.playback.lastChangedBy = me.userId;
       r.playback.seq++;

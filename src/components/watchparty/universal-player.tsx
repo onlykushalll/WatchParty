@@ -400,11 +400,19 @@ function YouTubePlayer({
   }>) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const containerId = useRef(`yt-${Math.random().toString(36).slice(2, 8)}`).current;
   const playerRef = useRef<YT.Player | null>(null);
   const guardRef = useRef(false);
   const lastSeq = useRef(-1);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Keep latest playback + clockOffset in refs so onReady can access them
+  // without being stale (the effect only re-runs on videoId change).
+  const latestPlayback = useRef(playback);
+  const latestClockOffset = useRef(clockOffset);
+  latestPlayback.current = playback;
+  latestClockOffset.current = clockOffset;
 
   // Load YouTube IFrame API once.
   useEffect(() => {
@@ -439,10 +447,12 @@ function YouTubePlayer({
 
     playerRef.current = new window.YT.Player(el, {
       videoId,
+      width: "100%",
+      height: "100%",
       playerVars: {
         autoplay: 0,
-        controls: 0,
-        disablekb: 1,
+        controls: 1,
+        disablekb: 0,
         modestbranding: 1,
         playsinline: 1,
         rel: 0,
@@ -451,7 +461,23 @@ function YouTubePlayer({
       events: {
         onReady: () => {
           try {
-            playerRef.current?.setPlaybackRate(playback.playbackRate || 1);
+            const pb = latestPlayback.current;
+            const co = latestClockOffset.current;
+            playerRef.current?.setPlaybackRate(pb.playbackRate || 1);
+            // CRITICAL: immediately sync to current room state so late
+            // joiners land on the same position as everyone else.
+            const serverNow = Date.now() + co;
+            const elapsed = pb.isPlaying
+              ? (serverNow - pb.lastChangedAt) / 1000
+              : 0;
+            const expectedTime = pb.currentTime + elapsed;
+            playerRef.current?.seekTo(expectedTime, true);
+            if (pb.isPlaying) {
+              playerRef.current?.playVideo();
+            } else {
+              playerRef.current?.pauseVideo();
+            }
+            lastSeq.current = pb.seq;
           } catch {}
           queueMicrotask(() => { guardRef.current = false; });
         },
@@ -522,7 +548,8 @@ function YouTubePlayer({
 
   return (
     <div className="h-full w-full bg-black">
-      <div ref={containerRef} className="h-full w-full" />
+      <style>{`#${containerId} iframe { width: 100% !important; height: 100% !important; position: absolute !important; top: 0 !important; left: 0 !important; }`}</style>
+      <div id={containerId} ref={containerRef} className="h-full w-full" />
       {error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/80">
           <div className="text-center">
@@ -535,7 +562,7 @@ function YouTubePlayer({
   );
 }
 
-/* ─────────────────────────── Iframe portal ─────────────────────────── */
+/* ─────────��───────────────── Iframe portal ─────────────────────────── */
 
 function IframePortal({ url, onError }: { url: string; onError: (e: string) => void }) {
   // Route through our /api/proxy to strip X-Frame-Options + follow redirects.

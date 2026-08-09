@@ -7,7 +7,6 @@ import { UniversalPlayer } from "@/components/watchparty/universal-player";
 import { VirtualBrowser } from "@/components/watchparty/virtual-browser";
 import { ChatPanel } from "@/components/watchparty/chat-panel";
 import { QueuePanel } from "@/components/watchparty/queue-panel";
-import { ReactionRain } from "@/components/watchparty/reaction-rain";
 import {
   ParticipantsList,
   SyncIndicator,
@@ -42,11 +41,6 @@ import {
   MonitorPlay,
   Link2,
   ArrowRight,
-  Flame,
-  Heart,
-  Laugh,
-  PartyPopper,
-  ThumbsUp,
   Menu,
 } from "lucide-react";
 
@@ -71,14 +65,6 @@ function useTheme() {
   };
   return { theme, setTheme };
 }
-
-const REACTIONS = [
-  { emoji: "🔥", icon: Flame },
-  { emoji: "❤️", icon: Heart },
-  { emoji: "😂", icon: Laugh },
-  { emoji: "🎉", icon: PartyPopper },
-  { emoji: "👍", icon: ThumbsUp },
-];
 
 function genId() {
   return "u-" + Math.random().toString(36).slice(2, 10);
@@ -576,21 +562,6 @@ function RoomView({
                     hasNext={hasNext}
                   />
                 </div>
-                {/* Reaction rain overlay */}
-                <ReactionRain reactions={engine.reactions} />
-                {/* Reaction bar */}
-                <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 gap-1 rounded-full border bg-background/80 p-1 shadow-lg backdrop-blur">
-                  {REACTIONS.map((r) => (
-                    <button
-                      key={r.emoji}
-                      onClick={() => engine.sendReaction(r.emoji)}
-                      className="flex h-8 w-8 items-center justify-center rounded-full text-lg transition-transform hover:scale-125 hover:bg-accent"
-                      title={r.emoji}
-                    >
-                      {r.emoji}
-                    </button>
-                  ))}
-                </div>
               </>
             ) : (
               <VirtualBrowser
@@ -671,6 +642,8 @@ function SidePanel({
             messages={engine.messages}
             onSend={engine.sendChat}
             youColor={engine.you?.color || "#a78bfa"}
+            youId={userId}
+            participantCount={engine.participants.length}
           />
         </TabsContent>
         <TabsContent value="queue" className="mt-0 min-h-0 flex-1">

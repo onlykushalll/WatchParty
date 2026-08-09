@@ -128,11 +128,11 @@ export function VirtualBrowser({ vmUrl, password, userName }: VirtualBrowserProp
       </div>
 
       {/* Neko iframe */}
-      <div className="relative min-h-0 flex-1">
+      <div className="relative min-h-0 flex-1 bg-black">
         <iframe
           ref={iframeRef}
           src={nekoSrc}
-          className="h-full w-full border-0"
+          className="absolute inset-0 h-full w-full border-0"
           allow="autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-read; clipboard-write"
           allowFullScreen
           sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation allow-pointer-lock"
@@ -147,7 +147,7 @@ export function VirtualBrowser({ vmUrl, password, userName }: VirtualBrowserProp
             <Loader2 className="h-8 w-8 animate-spin text-violet-400" />
             <p className="text-sm text-zinc-400">Starting virtual browser…</p>
             <p className="text-xs text-zinc-600">
-              First launch takes ~10s (booting Chrome in Docker)
+              Launching headless Chrome (takes ~5s)
             </p>
           </div>
         )}
