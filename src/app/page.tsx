@@ -27,6 +27,7 @@ import { toast } from "sonner";
 import {
   Play,
   Users,
+  Crown,
   MessageSquare,
   ListVideo,
   Sun,
@@ -427,19 +428,82 @@ function RoomView({
 
   return (
     <div className="flex h-screen flex-col bg-background">
-      {/* ── Top bar ── */}
+      {/* ── Top bar with everything ── */}
       <header className="flex shrink-0 items-center gap-2 border-b bg-background/80 px-3 py-2 backdrop-blur sm:px-4">
         <Button variant="ghost" size="sm" onClick={onLeave} className="gap-1.5">
           <Play className="h-3.5 w-3.5 fill-current" />
           <span className="hidden sm:inline">WatchParty</span>
         </Button>
+
+        {/* Mode switcher — moved to header, bigger */}
+        <div className="flex shrink-0 rounded-lg border bg-muted/50 p-1">
+          <button
+            onClick={() => setMode("video")}
+            className={`flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-semibold transition-all ${
+              mode === "video"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <Play className="h-3.5 w-3.5" /> Video
+          </button>
+          <button
+            onClick={() => setMode("vm")}
+            className={`flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-semibold transition-all ${
+              mode === "vm"
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <MonitorPlay className="h-3.5 w-3.5" /> VM Browser
+          </button>
+        </div>
+
         <div className="min-w-0 flex-1">
           <h1 className="truncate text-sm font-semibold">
             {roomName || `room/${roomSlug}`}
           </h1>
-          <p className="hidden text-[10px] text-muted-foreground sm:block">
-            {roomSlug}
-          </p>
+        </div>
+
+        {/* Participants hover dropdown */}
+        <div className="group relative shrink-0">
+          <button className="flex h-8 items-center gap-1.5 rounded-lg border bg-card/50 px-2.5 text-xs font-medium hover:bg-accent transition-colors">
+            <Users className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">{engine.participants.length}</span>
+            <div className="flex -space-x-1">
+              {engine.participants.slice(0, 3).map((p) => (
+                <div
+                  key={p.userId}
+                  className="h-5 w-5 rounded-full border-2 border-background text-[9px] font-bold leading-5 text-white"
+                  style={{ backgroundColor: p.color }}
+                >
+                  {p.name.slice(0, 2).toUpperCase()}
+                </div>
+              ))}
+            </div>
+          </button>
+          {/* Hover dropdown */}
+          <div className="invisible absolute right-0 top-full z-50 mt-1 w-56 rounded-lg border bg-popover p-2 opacity-0 shadow-lg transition-all group-hover:visible group-hover:opacity-100">
+            <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              {engine.participants.length} online
+            </p>
+            <div className="flex flex-col gap-1">
+              {engine.participants.map((p) => (
+                <div key={p.userId} className="flex items-center gap-2 rounded-md px-1.5 py-1.5 hover:bg-accent/50">
+                  <div
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold text-white"
+                    style={{ backgroundColor: p.color }}
+                  >
+                    {p.name.slice(0, 2).toUpperCase()}
+                  </div>
+                  <span className="truncate text-xs font-medium">
+                    {p.userId === userId ? `${p.name} (you)` : p.name}
+                  </span>
+                  {p.isHost && <Crown className="ml-auto h-3 w-3 text-amber-400" />}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
 
         <SyncIndicator
@@ -493,76 +557,37 @@ function RoomView({
         </Sheet>
       </header>
 
-      {/* ── Main ── */}
+      {/* ── Main: full-height video/VM + side panel ── */}
       <div className="flex min-h-0 flex-1">
-        {/* Player area */}
         <main className="flex min-w-0 flex-1 flex-col">
-          {/* URL bar + mode switcher */}
-          <div className="flex shrink-0 items-center gap-2 border-b bg-card/30 px-3 py-2">
-            {/* Mode switcher */}
-            <div className="flex shrink-0 rounded-lg border bg-muted/50 p-0.5">
-              <button
-                onClick={() => setMode("video")}
-                className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-medium transition-colors ${
-                  mode === "video"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <Play className="h-3 w-3" /> Video
-              </button>
-              <button
-                onClick={() => setMode("vm")}
-                className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-medium transition-colors ${
-                  mode === "vm"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <MonitorPlay className="h-3 w-3" /> VM Browser
-              </button>
+          {/* URL bar (video mode only) */}
+          {mode === "video" && (
+            <div className="flex shrink-0 items-center gap-2 border-b bg-card/30 px-3 py-2">
+              <Input
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                placeholder="Paste a video URL — YouTube, .m3u8, .mp4, or any site"
+                className="h-8 text-sm"
+                onKeyDown={(e) => e.key === "Enter" && addUrl()}
+              />
+              <Button size="sm" className="h-8 gap-1" onClick={addUrl}>
+                <Plus className="h-3.5 w-3.5" /> Add
+              </Button>
             </div>
-            {mode === "video" && (
-              <div className="flex flex-1 items-center gap-1.5">
-                <Input
-                  value={urlInput}
-                  onChange={(e) => setUrlInput(e.target.value)}
-                  placeholder="Paste a video URL — YouTube, .m3u8, .mp4, or any site"
-                  className="h-8 text-sm"
-                  onKeyDown={(e) => e.key === "Enter" && addUrl()}
-                />
-                <Button size="sm" className="h-8 gap-1" onClick={addUrl}>
-                  <Plus className="h-3.5 w-3.5" /> Add
-                </Button>
-              </div>
-            )}
-            {mode === "vm" && (
-              <div className="flex flex-1 items-center gap-1.5">
-                <span className="text-xs text-muted-foreground">
-                  Shared virtual browser — browse any site together in real-time
-                </span>
-                <Badge variant="secondary" className="ml-auto gap-1">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
-                  live
-                </Badge>
-              </div>
-            )}
-          </div>
+          )}
 
-          {/* Stage: Video or Virtual Browser */}
+          {/* Stage: full-height Video or Virtual Browser */}
           <div className="relative min-h-0 flex-1 bg-black">
             {mode === "video" ? (
-              <>
-                <div className="absolute inset-0">
-                  <UniversalPlayer
-                    playback={engine.playback}
-                    clockOffset={engine.stats.clockOffset}
-                    onIntent={engine.sendIntent}
-                    onNext={() => engine.queueNext()}
-                    hasNext={hasNext}
-                  />
-                </div>
-              </>
+              <div className="absolute inset-0">
+                <UniversalPlayer
+                  playback={engine.playback}
+                  clockOffset={engine.stats.clockOffset}
+                  onIntent={engine.sendIntent}
+                  onNext={() => engine.queueNext()}
+                  hasNext={hasNext}
+                />
+              </div>
             ) : (
               <VirtualBrowser
                 vmUrl={typeof window !== "undefined" ? (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? "http://localhost:3004" : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "vm"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//vm.${window.location.hostname}`; })()) : "https://vm.kushalneedsmcp.online"}
@@ -578,21 +603,6 @@ function RoomView({
                 onReleaseControl={engine.releaseVmControl}
               />
             )}
-          </div>
-
-          {/* Participants + status bar */}
-          <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-t bg-card/30 px-3 py-2">
-            <ParticipantsList
-              participants={engine.participants}
-              youId={userId}
-            />
-            <div className="ml-auto flex items-center gap-2">
-              {mode === "video" && !hasVideo && (
-                <span className="text-xs text-muted-foreground">
-                  Paste a URL to start →
-                </span>
-              )}
-            </div>
           </div>
         </main>
 
