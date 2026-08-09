@@ -707,13 +707,13 @@ function RoomView({
                   <Button size="lg" variant="outline" className="gap-2" onClick={syncPause}>
                     <Pause className="h-5 w-5" /> Sync Pause
                   </Button>
-                  <Button size="lg" className="gap-2 bg-violet-600 hover:bg-violet-700" onClick={() => window.open(`/api/bookmarklet?room=${roomSlug}`, "_blank")}>
-                    <Zap className="h-5 w-5" /> Get Sync Bookmarklet
+                  <Button size="lg" className="gap-2 bg-violet-600 hover:bg-violet-700" onClick={() => window.open("https://github.com/onlykushalll/WatchParty/tree/main/browser-extension", "_blank")}>
+                    <Zap className="h-5 w-5" /> Install Sync Extension
                   </Button>
                 </div>
 
                 <div className="max-w-md rounded-lg border border-violet-500/30 bg-violet-500/10 p-3 text-center text-xs text-violet-300">
-                  <strong>Best sync method:</strong> Open the movie site in your browser → click the bookmarklet → enter room code <code className="rounded bg-violet-500/20 px-1">{roomSlug}</code>. The video hooks directly — play/pause/seek all sync with &lt;100ms latency. No streaming, no lag. This is how w2g works.
+                  <strong>Best sync (like w2g):</strong> Install the extension once → open any movie site → click the WatchParty icon → enter room code <code className="rounded bg-violet-500/20 px-1">{roomSlug}</code>. Video hooks directly — play/pause/seek sync with &lt;100ms. No streaming, no lag.
                 </div>
 
                 {/* Copy room link */}
