@@ -44,9 +44,6 @@ import {
   ArrowRight,
   Menu,
   Upload,
-  ExternalLink,
-  Pause,
-  Loader2,
 } from "lucide-react";
 
 // ── Inline theme hook (avoids module resolution issues with Turbopack
@@ -403,9 +400,7 @@ function RoomView({
   const [urlInput, setUrlInput] = useState("");
   const [copied, setCopied] = useState(false);
   const [tab, setTab] = useState<"chat" | "queue">("chat");
-  const [mode, setMode] = useState<"video" | "vm" | "external">("video");
-  const [countdown, setCountdown] = useState<number | null>(null);
-  const [externalUrl, setExternalUrl] = useState("https://cinevo.nl/watch/movie/aashiqui-2-192558");
+  const [mode, setMode] = useState<"video" | "vm">("video");
 
   const shareUrl = useMemo(
     () => (typeof window !== "undefined" ? `${window.location.origin}/#/room/${roomSlug}` : ""),
@@ -423,88 +418,10 @@ function RoomView({
   const addUrl = () => {
     const u = urlInput.trim();
     if (!u) return;
-    // If it's a streaming site (cinevo, netmirror, etc.), try to extract the video URL
-    if (u.match(/cinevo|netmirror|fmovies|soap2day|putlocker|watchmovies/i)) {
-      extractAndPlay(u);
-    } else {
-      // Directly set as current video (not just queue) + add to queue
-      engine.sendIntent({ videoUrl: u });
-      engine.queueAdd(u);
-      setUrlInput("");
-      toast.success("Video loaded — playing now");
-    }
-  };
-
-  const [extracting, setExtracting] = useState(false);
-
-  const extractAndPlay = async (url: string) => {
-    setExtracting(true);
-    toast.info("Extracting video stream… (may take 20-30s)");
-    try {
-      const extractorUrl = typeof window !== "undefined" && window.location.hostname === "localhost"
-        ? "http://localhost:3005"
-        : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "extract"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//extract.${window.location.hostname}`; })();
-      const res = await fetch(`${extractorUrl}/extract`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
-      });
-      const data = await res.json();
-      if (data.ok && data.videoUrls && data.videoUrls.length > 0) {
-        // Find the best URL (prefer .m3u8 for HLS, then .mp4)
-        const hlsUrl = data.videoUrls.find((u: string) => u.includes(".m3u8"));
-        const mp4Url = data.videoUrls.find((u: string) => u.includes(".mp4"));
-        const bestUrl = hlsUrl || mp4Url || data.videoUrls[0];
-        engine.sendIntent({ videoUrl: bestUrl, videoType: hlsUrl ? "hls" : "mp4" });
-        toast.success(`Video extracted! Playing: ${data.title || "movie"}`);
-        setMode("video");
-      } else {
-        toast.error("Could not extract video — try the Watch Together mode");
-      }
-    } catch (e) {
-      toast.error("Extractor service not available — using URL directly");
-      engine.queueAdd(url);
-    } finally {
-      setExtracting(false);
-      setUrlInput("");
-    }
-  };
-
-  const openExternal = () => {
-    const url = externalUrl.trim();
-    if (!url) return;
-    if (!url.match(/^https?:\/\//)) {
-      toast.error("Enter a full URL (https://...)");
-      return;
-    }
-    window.open(url, "_blank", "noopener,noreferrer");
-    toast.success("Opened in new tab — both you and your friend need to open this URL");
-  };
-
-  const startCountdown = () => {
-    setCountdown(3);
-    let n = 3;
-    const interval = setInterval(() => {
-      n--;
-      if (n <= 0) {
-        clearInterval(interval);
-        setCountdown(null);
-        engine.sendChat("🎬 3-2-1 sync — PRESS PLAY NOW!");
-        toast.success("PRESS PLAY on the video NOW!");
-      } else {
-        setCountdown(n);
-      }
-    }, 1000);
-  };
-
-  const syncPlay = () => {
-    engine.sendChat("▶️ Play — everyone press play!");
-    toast.success("Sync signal sent — everyone press play!");
-  };
-
-  const syncPause = () => {
-    engine.sendChat("⏸️ Pause — everyone pause!");
-    toast.success("Sync signal sent — everyone pause!");
+    engine.sendIntent({ videoUrl: u });
+    engine.queueAdd(u);
+    setUrlInput("");
+    toast.success("Video loaded");
   };
 
   const hasVideo = !!engine.playback?.videoUrl;
@@ -538,14 +455,7 @@ function RoomView({
           >
             <MonitorPlay className="h-3 w-3" /> Virtual PC
           </button>
-          <button
-            onClick={() => setMode("external")}
-            className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-semibold transition-all ${
-              mode === "external" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <ExternalLink className="h-3 w-3" /> Watch Together
-          </button>
+
         </div>
 
         {/* Compact URL bar in header (video mode) */}
@@ -557,11 +467,9 @@ function RoomView({
               placeholder="YouTube, MP4, HLS, or cinevo.nl URL…"
               className="h-7 max-w-xs flex-1 text-xs"
               onKeyDown={(e) => e.key === "Enter" && addUrl()}
-              disabled={extracting}
             />
-            <Button size="sm" className="h-7 gap-1 px-2 text-xs" onClick={addUrl} disabled={extracting}>
-              {extracting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
-              {extracting ? "…" : "Add"}
+            <Button size="sm" className="h-7 gap-1 px-2 text-xs" onClick={addUrl}>
+              <Plus className="h-3 w-3" /> Add
             </Button>
             <label className="flex h-7 cursor-pointer items-center gap-1 rounded-md border bg-card/50 px-2 text-xs font-medium hover:bg-accent">
               <Upload className="h-3 w-3" />
@@ -686,7 +594,7 @@ function RoomView({
       {/* ── Main: full-height video + side panel ── */}
       <div className="flex min-h-0 flex-1">
         <main className="flex min-w-0 flex-1 flex-col">
-          {/* Stage: full-height Video or Watch Together */}
+          {/* Stage: full-height Video or Virtual PC */}
           <div className="relative min-h-0 flex-1 bg-black">
             {mode === "video" ? (
               <div className="absolute inset-0">
@@ -698,7 +606,7 @@ function RoomView({
                   hasNext={hasNext}
                 />
               </div>
-            ) : mode === "vm" ? (
+            ) : (
               <VirtualBrowser
                 vmUrl={typeof window !== "undefined" ? (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? "http://localhost:3004" : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "vm"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//vm.${window.location.hostname}`; })()) : "https://vm.kushalneedsmcp.online"}
                 password="watchparty"
@@ -712,74 +620,6 @@ function RoomView({
                 onRequestControl={engine.requestVmControl}
                 onReleaseControl={engine.releaseVmControl}
               />
-            ) : (
-              /* Watch Together mode — open external site + sync buttons */
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-6 bg-zinc-950 p-8">
-                {countdown !== null && (
-                  <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90">
-                    <span className="text-[120px] font-bold text-violet-400">{countdown}</span>
-                  </div>
-                )}
-                <div className="text-center">
-                  <h2 className="text-2xl font-bold text-white">Watch Together</h2>
-                  <p className="mt-2 text-sm text-zinc-400">
-                    Open the movie site in a new tab, then sync with your friend
-                  </p>
-                </div>
-
-                {/* URL input */}
-                <div className="flex w-full max-w-lg items-center gap-2">
-                  <Input
-                    value={externalUrl}
-                    onChange={(e) => setExternalUrl(e.target.value)}
-                    placeholder="https://cinevo.nl/watch/movie/..."
-                    className="h-10 flex-1 bg-zinc-900 text-sm text-white"
-                  />
-                  <Button className="h-10 gap-2" onClick={openExternal}>
-                    <ExternalLink className="h-4 w-4" /> Open
-                  </Button>
-                </div>
-
-                <p className="max-w-md text-center text-xs text-zinc-500">
-                  This opens the movie site in a new tab for you. Share the room link with your friend — they open the same URL. Then use the sync buttons below to start together.
-                </p>
-
-                {/* Sync buttons */}
-                <div className="flex flex-wrap gap-3">
-                  <Button size="lg" className="gap-2 bg-emerald-600 hover:bg-emerald-700" onClick={startCountdown}>
-                    <Play className="h-5 w-5" /> 3-2-1 Sync Start
-                  </Button>
-                  <Button size="lg" variant="outline" className="gap-2" onClick={syncPause}>
-                    <Pause className="h-5 w-5" /> Sync Pause
-                  </Button>
-                  <Button size="lg" className="gap-2 bg-violet-600 hover:bg-violet-700" onClick={() => window.open("https://github.com/onlykushalll/WatchParty/tree/main/browser-extension", "_blank")}>
-                    <Zap className="h-5 w-5" /> Install Sync Extension
-                  </Button>
-                </div>
-
-                <div className="max-w-md rounded-lg border border-violet-500/30 bg-violet-500/10 p-3 text-center text-xs text-violet-300">
-                  <strong>Best sync (like w2g):</strong> Install the extension once → open any movie site → click the WatchParty icon → enter room code <code className="rounded bg-violet-500/20 px-1">{roomSlug}</code>. Video hooks directly — play/pause/seek sync with &lt;100ms. No streaming, no lag.
-                </div>
-
-                {/* Copy room link */}
-                <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-2">
-                  <span className="text-xs text-zinc-500">Share room link:</span>
-                  <code className="text-xs text-violet-300">{shareUrl}</code>
-                  <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={copyLink}>
-                    {copied ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
-                  </Button>
-                </div>
-
-                {/* Sync status */}
-                <div className="flex items-center gap-2 text-xs text-zinc-500">
-                  <SyncIndicator
-                    connected={engine.stats.connected}
-                    rtt={engine.stats.rtt}
-                    drift={engine.stats.clockOffset}
-                  />
-                  <span>· Chat is live — coordinate with your friend</span>
-                </div>
-              </div>
             )}
           </div>
         </main>
