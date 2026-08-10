@@ -427,9 +427,11 @@ function RoomView({
     if (u.match(/cinevo|netmirror|fmovies|soap2day|putlocker|watchmovies/i)) {
       extractAndPlay(u);
     } else {
+      // Directly set as current video (not just queue) + add to queue
+      engine.sendIntent({ videoUrl: u });
       engine.queueAdd(u);
       setUrlInput("");
-      toast.success("Added to queue");
+      toast.success("Video loaded — playing now");
     }
   };
 
