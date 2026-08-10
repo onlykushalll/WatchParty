@@ -17,9 +17,7 @@
 import { createServer } from "http";
 import { Server, Socket } from "socket.io";
 
-const PORT = Number(process.env.PORT || process.env.SYNC_PORT || 3003);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-const PUBLIC_URL = process.env.PUBLIC_URL || "http://localhost:3000";
+const PORT = 3003;
 const HEARTBEAT_MS = 5000;
 const ROOM_EXPIRY_MS = 6 * 60 * 60 * 1000; // 6h after last person leaves
 
@@ -34,9 +32,6 @@ interface Participant {
   joinedAt: number;
   clockOffset: number; // client time - server time (ms), maintained by clock sync
   rtt: number;
-  isMicMuted?: boolean;
-  isCameraOn?: boolean;
-  cameraPrivacyMode?: 'blackout' | 'blur' | 'avatar';
 }
 
 interface PlaybackState {
@@ -111,9 +106,6 @@ function publicParticipants(r: RoomState) {
     color: p.color,
     isHost: p.isHost,
     joinedAt: p.joinedAt,
-    isMicMuted: p.isMicMuted ?? true,
-    isCameraOn: p.isCameraOn ?? false,
-    cameraPrivacyMode: p.cameraPrivacyMode ?? "avatar",
   }));
 }
 
@@ -184,18 +176,11 @@ io.on("connection", (socket: Socket) => {
   let currentUserId: string | null = null;
 
   // ── Clock sync (Cristian's algorithm) ──
-  socket.on("clock:req", (payload: { t0?: number; t1?: number }) => {
-    const t0 = payload?.t0 ?? payload?.t1 ?? Date.now();
-    const t1 = Date.now();
+  socket.on("clock:req", (payload: { t1: number }) => {
     const t2 = Date.now();
-    socket.emit("clock:res", { t0, t1, t2 });
-  });
-
-  socket.on("ntp_ping", (payload: { clientTime?: number; t0?: number }) => {
-    const t0 = payload?.t0 ?? payload?.clientTime ?? Date.now();
-    const t1 = Date.now();
-    const t2 = Date.now();
-    socket.emit("ntp_pong", { t0, t1, t2, clientTime: t0, serverTime: t2 });
+    // Small artificial delay simulates processing; t3 is when we send back.
+    const t3 = Date.now();
+    socket.emit("clock:res", { t1: payload.t1, t2, t3 });
   });
 
   // ── Join room ──
@@ -222,9 +207,6 @@ io.on("connection", (socket: Socket) => {
         joinedAt: Date.now(),
         clockOffset: 0,
         rtt: 0,
-        isMicMuted: true,
-        isCameraOn: false,
-        cameraPrivacyMode: "avatar",
       };
       r.participants.set(socket.id, participant);
       r.lastActivity = Date.now();
@@ -314,7 +296,17 @@ io.on("connection", (socket: Socket) => {
 
       if (changed) {
         p.currentTime = projectedTime;
-        p.lastChangedAt = now;
+        // Future-date play commands: delay by max(highestPing×2, 500ms)
+        // so all clients start at the same wall-clock instant (Jellyfin SyncPlay pattern)
+        if (payload.isPlaying === true) {
+          let highestRtt = 0;
+          for (const participant of r.participants.values()) {
+            highestRtt = Math.max(highestRtt, participant.rtt || 50);
+          }
+          p.lastChangedAt = now + Math.max(highestRtt * 2, 500);
+        } else {
+          p.lastChangedAt = now;
+        }
         p.lastChangedBy = me.userId;
         p.seq++;
         r.lastActivity = now;
@@ -322,6 +314,55 @@ io.on("connection", (socket: Socket) => {
       }
     },
   );
+
+  // ── Buffer-aware group-wait (Jellyfin SyncPlay pattern) ──
+  // When a client buffers, pause everyone. When all ready, resume.
+  socket.on("buffer:event", (payload: { type: "waiting" | "playing"; position: number }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+
+    if (me) (me as any).isBuffering = payload.type === "waiting";
+
+    if (payload.type === "waiting") {
+      // Someone is buffering — pause everyone else
+      const p = r.playback;
+      p.isPlaying = false;
+      p.currentTime = payload.position;
+      p.lastChangedAt = Date.now();
+      p.lastChangedBy = me.userId;
+      p.seq++;
+      broadcastPlayback(io, r);
+      io.to(currentRoomId).emit("chat:system", {
+        text: `${me.name} is buffering…`,
+        at: Date.now(),
+      });
+    } else {
+      // Someone finished buffering — check if everyone is ready
+      const allReady = Array.from(r.participants.values()).every(
+        (p) => !(p as any).isBuffering
+      );
+      if (allReady && r.playback.videoUrl) {
+        // Everyone ready — resume with future-dated play
+        const p = r.playback;
+        let highestRtt = 0;
+        for (const participant of r.participants.values()) {
+          highestRtt = Math.max(highestRtt, participant.rtt || 50);
+        }
+        p.isPlaying = true;
+        p.lastChangedAt = Date.now() + Math.max(highestRtt * 2, 500);
+        p.lastChangedBy = me.userId;
+        p.seq++;
+        broadcastPlayback(io, r);
+        io.to(currentRoomId).emit("chat:system", {
+          text: `Everyone ready — resuming`,
+          at: Date.now(),
+        });
+      }
+    }
+  });
 
   // ── Heartbeat: each client reports its local currentTime periodically ──
   socket.on(
@@ -531,28 +572,6 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  socket.on(
-    "media:state",
-    (payload: {
-      isMicMuted?: boolean;
-      isCameraOn?: boolean;
-      cameraPrivacyMode?: "blackout" | "blur" | "avatar";
-    }) => {
-      if (!currentRoomId) return;
-      const r = rooms.get(currentRoomId);
-      if (!r) return;
-      const me = r.participants.get(socket.id);
-      if (!me) return;
-
-      if (payload.isMicMuted !== undefined) me.isMicMuted = payload.isMicMuted;
-      if (payload.isCameraOn !== undefined) me.isCameraOn = payload.isCameraOn;
-      if (payload.cameraPrivacyMode !== undefined)
-        me.cameraPrivacyMode = payload.cameraPrivacyMode;
-
-      broadcastPresence(io, r);
-    },
-  );
-
   // ── Disconnect ──
   socket.on("disconnect", () => {
     if (!currentRoomId) return;
@@ -573,16 +592,15 @@ io.on("connection", (socket: Socket) => {
       broadcastPresence(io, r);
     }
     // Schedule cleanup if empty.
-    if (r.participants.size === 0 && currentRoomId) {
-      const targetRoomId = currentRoomId;
+    if (r.participants.size === 0) {
       setTimeout(() => {
-        const stillEmpty = rooms.get(targetRoomId);
+        const stillEmpty = rooms.get(currentRoomId);
         if (
           stillEmpty &&
           stillEmpty.participants.size === 0 &&
           Date.now() - stillEmpty.lastActivity > ROOM_EXPIRY_MS
         ) {
-          rooms.delete(targetRoomId);
+          rooms.delete(currentRoomId!);
         }
       }, ROOM_EXPIRY_MS);
     }

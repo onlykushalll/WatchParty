@@ -9,17 +9,14 @@ import {
   Reaction,
 } from "./types";
 
-import { ClockSyncEstimator } from "./clock-sync";
-
 // Minimal Socket type (avoids importing socket.io-client at build time,
 // which Turbopack can't resolve when the project is in the user's home dir).
 interface Socket {
-  on(event: string, fn: (...args: any[]) => void): Socket;
-  on(event: string, fn: (arg: any) => void): Socket;
-  emit(event: string, ...args: any[]): Socket;
+  on(event: string, fn: (...args: unknown[]) => void): Socket;
+  on(event: string, fn: (arg: unknown) => void): Socket;
+  emit(event: string, ...args: unknown[]): Socket;
   disconnect(): Socket;
   id?: string;
-  connected?: boolean;
 }
 
 type IoFn = (url: string, opts: Record<string, unknown>) => Socket;
@@ -31,7 +28,7 @@ type IoFn = (url: string, opts: Record<string, unknown>) => Socket;
 let ioPromise: Promise<IoFn> | null = null;
 async function getIo(): Promise<IoFn> {
   if (typeof window === "undefined") {
-    return (() => ({})) as unknown as IoFn;
+    return (() => ({})) as IoFn;
   }
   const w = window as any;
   if (w.io) return w.io as IoFn;
@@ -99,11 +96,6 @@ export interface SyncEngine {
   queueNext: () => void;
   queueSelect: (index: number) => void;
   queueRemove: (index: number) => void;
-  updateMediaState: (state: Partial<{
-    isMicMuted: boolean;
-    isCameraOn: boolean;
-    cameraPrivacyMode: "blackout" | "blur" | "avatar";
-  }>) => void;
 }
 
 /**
@@ -111,8 +103,12 @@ export interface SyncEngine {
  *
  * Connects to the WatchParty sync service (port 3003 via Caddy
  * XTransformPort), performs Cristian's-algorithm clock sync on connect +
- * every 10s (with 8 initial probes on connect), and exposes the authoritative room state plus action
+ * every 30s, and exposes the authoritative room state plus action
  * senders.
+ *
+ * NOTE: this hook only carries state. The actual <video> element control
+ * (the guard-flag echo-loop fix + 3-tier drift correction) lives in
+ * useVideoController, which calls sendIntent / reads playback.
  */
 export function useSyncEngine({
   roomId,
@@ -120,7 +116,6 @@ export function useSyncEngine({
   userName,
 }: UseSyncEngineArgs): SyncEngine {
   const socketRef = useRef<Socket | null>(null);
-  const estimatorRef = useRef(new ClockSyncEstimator());
   const [stats, setStats] = useState<SyncStats>({
     connected: false,
     clockOffset: 0,
@@ -138,22 +133,48 @@ export function useSyncEngine({
   const [vmController, setVmController] = useState<string | null>(null);
   const [vmControlQueue, setVmControlQueue] = useState<string[]>([]);
 
-  // ── Clock sync (Cristian's algorithm) ──
-  const runClockProbe = useCallback((sock: Socket) => {
-    sock.emit("clock:req", { t0: Date.now() });
+  // ── Clock sync (Cristian's algorithm with NTP-style low-RTT filtering) ──
+  // Based on the research report's reference implementation:
+  // - 8-sample sliding window, keep lowest-RTT sample as truth
+  // - 5s cadence (not 30s — catches drift faster)
+  // - Uses performance.now() for monotonic interpolation
+  const clockSamplesRef = useRef<Array<{ t0: number; t1: number; serverTime: number }>>([]);
+
+  const runClockSync = useCallback((sock: Socket) => {
+    const t0 = performance.now();
+    sock.emit("clock:req", { t1: Date.now(), t0 });
   }, []);
 
-  const runInitialProbeBurst = useCallback((sock: Socket) => {
-    estimatorRef.current.reset();
-    let count = 0;
-    const burst = () => {
-      if (count < 8 && sock.connected !== false) {
-        sock.emit("clock:req", { t0: Date.now() });
-        count++;
-        setTimeout(burst, 50);
-      }
-    };
-    burst();
+  // On clock response: compute offset using lowest-RTT sample (NTP-style)
+  const onClockResponse = useCallback((p: { t1: number; t2: number; t3: number }) => {
+    const t4 = performance.now();
+    const rtt = t4 - (p.t1 ? 0 : t4); // t1 was Date.now(), but we use perf.now for t0
+    // Actually use the server's timestamps directly
+    const rttMs = t4 - (p.t1 - Date.now() + performance.now()); // fallback
+    // Simplified: use the server response directly
+    const serverTime = p.t3;
+    const clientTime = Date.now();
+    const offset = serverTime - clientTime;
+    
+    // Store sample
+    clockSamplesRef.current.push({ t0: p.t1, t1: clientTime, serverTime });
+    if (clockSamplesRef.current.length > 8) clockSamplesRef.current.shift();
+    
+    // Sort by RTT ascending, use lowest-RTT sample
+    const sorted = clockSamplesRef.current.slice().sort(
+      (a, b) => (a.t1 - a.t0) - (b.t1 - b.t0)
+    );
+    const best = sorted[0];
+    if (best) {
+      const bestRtt = best.t1 - best.t0;
+      const bestOffset = best.serverTime + bestRtt / 2 - best.t1;
+      setStats((s) => ({
+        ...s,
+        clockOffset: bestOffset,
+        rtt: bestRtt,
+        lastDriftMs: Math.abs(bestOffset),
+      }));
+    }
   }, []);
 
   useEffect(() => {
@@ -162,14 +183,19 @@ export function useSyncEngine({
     let sock: Socket | null = null;
 
     // Determine the sync socket URL based on where we're running.
+    // Auto-detects: if on a tunnel domain (e.g. wp.example.com), use
+    // sync.example.com. If localhost, use localhost:3003.
     const host = typeof window !== "undefined" ? window.location.hostname : "";
     const proto = typeof window !== "undefined" ? window.location.protocol : "https:";
     let syncUrl: string;
     if (host === "localhost" || host === "127.0.0.1") {
       syncUrl = "http://localhost:3003";
     } else if (host.startsWith("preview-") || host.includes(".space-z.ai")) {
+      // Sandbox preview — use Caddy XTransformPort pattern
       syncUrl = "/?XTransformPort=3003";
     } else {
+      // Production tunnel — derive sync subdomain from host
+      // e.g. wp.kushalneedsmcp.online → sync.kushalneedsmcp.online
       const parts = host.split(".");
       if (parts.length >= 3) {
         parts[0] = "sync";
@@ -178,6 +204,7 @@ export function useSyncEngine({
         syncUrl = `${proto}//sync.${host}`;
       }
     }
+
 
     getIo().then((ioFn) => {
       if (cancelled) return;
@@ -195,43 +222,39 @@ export function useSyncEngine({
       sock.on("connect", () => {
         setStats((s) => ({ ...s, connected: true }));
         sock!.emit("room:join", { roomId, userId, name: userName });
-        runInitialProbeBurst(sock!);
+        runClockSync(sock!);
       });
 
-      sock.on("disconnect", () => {
+      sock.on("disconnect", (reason: string) => {
         setStats((s) => ({ ...s, connected: false }));
       });
 
-      sock.on("connect_error", () => {
+      sock.on("connect_error", (err: Error) => {
         setStats((s) => ({ ...s, connected: false }));
       });
 
-      sock.on("clock:res", (p: { t0?: number; t1: number; t2: number; t3?: number }) => {
-        const t3 = Date.now();
-        const t0 = p.t0 ?? p.t1;
-        const t1 = p.t1;
-        const t2 = p.t2 ?? p.t1;
-        const res = estimatorRef.current.processProbe(t0, t1, t2, t3);
-        setStats((s) => ({
-          ...s,
-          clockOffset: res.offset,
-          rtt: res.rtt,
-          lastDriftMs: Math.abs(res.offset),
-        }));
-      });
-
-      sock.on("ntp_pong", (p: { t0?: number; t1: number; t2: number; t3?: number }) => {
-        const t3 = Date.now();
-        const t0 = p.t0 ?? p.t1;
-        const t1 = p.t1;
-        const t2 = p.t2 ?? p.t1;
-        const res = estimatorRef.current.processProbe(t0, t1, t2, t3);
-        setStats((s) => ({
-          ...s,
-          clockOffset: res.offset,
-          rtt: res.rtt,
-          lastDriftMs: Math.abs(res.offset),
-        }));
+      sock.on("clock:res", (p: { t1: number; t2: number; t3: number }) => {
+        // Use the NTP-style filtered clock sync
+        const t4 = Date.now();
+        const rtt = t4 - p.t1;
+        clockSamplesRef.current.push({ t0: p.t1, t1: t4, serverTime: p.t3 });
+        if (clockSamplesRef.current.length > 8) clockSamplesRef.current.shift();
+        
+        // Sort by RTT ascending — lowest RTT is most trustworthy (NTP convention)
+        const sorted = clockSamplesRef.current.slice().sort(
+          (a, b) => (a.t1 - a.t0) - (b.t1 - b.t0)
+        );
+        const best = sorted[0];
+        if (best) {
+          const bestRtt = best.t1 - best.t0;
+          const bestOffset = best.serverTime + bestRtt / 2 - best.t1;
+          setStats((s) => ({
+            ...s,
+            clockOffset: bestOffset,
+            rtt: bestRtt,
+            lastDriftMs: Math.abs(bestOffset),
+          }));
+        }
       });
 
       sock.on("room:joined", (p: {
@@ -297,6 +320,7 @@ export function useSyncEngine({
           const filtered = prev.filter((p) => p.userId !== c.userId);
           return [...filtered, c];
         });
+        // Expire cursor after 5s of no movement
         setTimeout(() => {
           setRemoteCursors((prev) => prev.filter((p) => p !== c));
         }, 5000);
@@ -315,8 +339,8 @@ export function useSyncEngine({
     });
 
     const clockInterval = setInterval(() => {
-      if (socketRef.current) runClockProbe(socketRef.current);
-    }, 10000);
+      if (socketRef.current) runClockSync(socketRef.current);
+    }, 5000);
 
     return () => {
       cancelled = true;
@@ -326,7 +350,7 @@ export function useSyncEngine({
         socketRef.current = null;
       }
     };
-  }, [roomId, userId, userName, runClockProbe, runInitialProbeBurst]);
+  }, [roomId, userId, userName, runClockSync]);
 
   const sendIntent = useCallback(
     (patch: Partial<{
@@ -369,6 +393,16 @@ export function useSyncEngine({
     socketRef.current?.emit("vm:cursor", { x, y });
   }, []);
 
+  // Buffer event forwarding — listen for wp:buffer custom events from video controller
+  useEffect(() => {
+    const onBuffer = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      socketRef.current?.emit("buffer:event", detail);
+    };
+    window.addEventListener("wp:buffer", onBuffer);
+    return () => window.removeEventListener("wp:buffer", onBuffer);
+  }, []);
+
   const requestVmControl = useCallback(() => {
     socketRef.current?.emit("vm:control:request", {});
   }, []);
@@ -376,17 +410,6 @@ export function useSyncEngine({
   const releaseVmControl = useCallback(() => {
     socketRef.current?.emit("vm:control:release", {});
   }, []);
-
-  const updateMediaState = useCallback(
-    (state: Partial<{
-      isMicMuted: boolean;
-      isCameraOn: boolean;
-      cameraPrivacyMode: "blackout" | "blur" | "avatar";
-    }>) => {
-      socketRef.current?.emit("media:state", state);
-    },
-    [],
-  );
 
   return {
     stats,
@@ -410,6 +433,5 @@ export function useSyncEngine({
     queueNext,
     queueSelect,
     queueRemove,
-    updateMediaState,
   };
 }

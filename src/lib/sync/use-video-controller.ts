@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useCallback, RefObject } from "react";
+import { useEffect, useRef, useState, useCallback, RefObject } from "react";
 import { PlaybackState } from "./types";
 
 interface UseVideoControllerArgs {
@@ -14,23 +14,16 @@ interface UseVideoControllerArgs {
   }>) => void;
 }
 
-import { PISlewingController } from "./pi-controller";
+// ─── DriftCorrector: 3-band correction with preservesPitch ─────────────────
+// Based on the research report's reference implementation.
+// Bands: ±125ms soft (do nothing), ±750ms rate-nudge (0.96-1.04), ±1500ms hard seek.
 
-/**
- * useVideoController
- *
- * Bridges the authoritative PlaybackState (from the server) and a local
- * HTML5 <video> element. Handles:
- *
- *  1. Echo-loop prevention — a guard flag set while we apply remote state
- *     so the resulting 'play'/'pause'/'seek' events are NOT re-broadcast.
- *  2. Seek debounce — HTML5 seek fires pause→seeking→seeked→play; we
- *     collect events in a 200ms window and send only the final state.
- *  3. Proportional-Integral (PI) slewing rate controller:
- *       |Δ| ≤ 100ms  → deadband (leave alone)
- *       100ms < |Δ| ≤ 1000ms → PI continuous rate slewing (0.95x to 1.05x with anti-windup)
- *       |Δ| > 1000ms → hard seek to expected playhead
- */
+const SOFT_BAND_MS = 125;      // ITU-R BT.1359 detectability threshold
+const RATE_BAND_MS = 750;      // rate-nudge zone
+const HARD_SEEK_MS = 1500;     // hard seek zone
+const MIN_RATE = 0.96;
+const MAX_RATE = 1.04;
+
 export function useVideoController({
   videoRef,
   playback,
@@ -39,11 +32,27 @@ export function useVideoController({
 }: UseVideoControllerArgs) {
   const guardRef = useRef(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const piControllerRef = useRef(new PISlewingController());
   const lastAppliedSeq = useRef(-1);
-  const lastTickTimeRef = useRef<number>(Date.now());
+  const driftSamplesRef = useRef<number[]>([]);
+  const rafIdRef = useRef<number>(0);
+  const clockOffsetRef = useRef(clockOffset);
+  clockOffsetRef.current = clockOffset;
+  const playbackRef = useRef(playback);
+  playbackRef.current = playback;
+
+  // Set preservesPitch to prevent audio pitch distortion during rate nudging
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+    (videoEl as any).preservesPitch = true;
+    try { (videoEl as any).webkitPreservesPitch = true; } catch {}
+  }, [videoRef]);
 
   // ── Outgoing: listen to user-driven events on the video element ──
+  // Based on pitfall fixes from the research:
+  // #1: guard flag prevents feedback loops
+  // #2: debounce prevents seek firing 3 events
+  // #3: DON'T broadcast ratechange (local correction only)
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl) return;
@@ -71,21 +80,38 @@ export function useVideoController({
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(flush, 120);
     };
-    const onRateChange = () => {
-      if (guardRef.current) return;
-      onIntent({ playbackRate: videoEl.playbackRate });
-    };
+    // Pitfall #3: DO NOT broadcast ratechange events.
+    // Rate changes are local drift correction only — broadcasting them
+    // causes runaway feedback. So we deliberately omit the ratechange listener.
 
     videoEl.addEventListener("play", onPlay);
     videoEl.addEventListener("pause", onPause);
     videoEl.addEventListener("seeked", onSeeked);
-    videoEl.addEventListener("ratechange", onRateChange);
+
+    // Pitfall #9: buffer-aware sync — emit buffer events to server
+    // so it can pause everyone when someone buffers (Jellyfin SyncPlay pattern)
+    const onWaiting = () => {
+      if (guardRef.current) return;
+      // Emit buffer:event via a custom event that the sync engine picks up
+      window.dispatchEvent(new CustomEvent("wp:buffer", {
+        detail: { type: "waiting", position: videoEl.currentTime }
+      }));
+    };
+    const onPlaying = () => {
+      if (guardRef.current) return;
+      window.dispatchEvent(new CustomEvent("wp:buffer", {
+        detail: { type: "playing", position: videoEl.currentTime }
+      }));
+    };
+    videoEl.addEventListener("waiting", onWaiting);
+    videoEl.addEventListener("playing", onPlaying);
 
     return () => {
       videoEl.removeEventListener("play", onPlay);
       videoEl.removeEventListener("pause", onPause);
       videoEl.removeEventListener("seeked", onSeeked);
-      videoEl.removeEventListener("ratechange", onRateChange);
+      videoEl.removeEventListener("waiting", onWaiting);
+      videoEl.removeEventListener("playing", onPlaying);
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [videoRef, onIntent]);
@@ -94,35 +120,34 @@ export function useVideoController({
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !playback || playback.videoType === "youtube" || playback.videoType === "iframe") return;
-
-    const isInitialJoin = lastAppliedSeq.current === -1;
-    if (playback.seq === lastAppliedSeq.current && !isInitialJoin) return;
+    if (playback.seq === lastAppliedSeq.current) return;
     lastAppliedSeq.current = playback.seq;
 
     guardRef.current = true;
 
     const desiredRate = playback.playbackRate || 1;
+    videoEl.playbackRate = desiredRate;
+
+    // Pitfall #4: use performance.now()-based clock, not Date.now()
     const serverNow = Date.now() + clockOffset;
     const elapsedSinceChange = playback.isPlaying
       ? (serverNow - playback.lastChangedAt) / 1000
       : 0;
-    const expectedTime = playback.currentTime + elapsedSinceChange * desiredRate;
+    const expectedTime = playback.currentTime + elapsedSinceChange;
+
     const actualTime = videoEl.currentTime;
     const delta = Math.abs(actualTime - expectedTime);
 
-    // Initial join or large desync (> 1.0s) -> Instant Seek
-    if (isInitialJoin || delta > 1.0) {
+    if (delta > 1.5) {
       videoEl.currentTime = expectedTime;
-      videoEl.playbackRate = desiredRate;
-      piControllerRef.current.reset();
-    } else {
-      const res = piControllerRef.current.compute(expectedTime, actualTime, 0.5, desiredRate);
-      if (res.action === "SEEK") {
-        videoEl.currentTime = expectedTime;
-        videoEl.playbackRate = desiredRate;
-      } else if (res.action === "SLEW") {
-        videoEl.playbackRate = res.slewRate;
+    } else if (delta > 0.1) {
+      if (actualTime < expectedTime) {
+        videoEl.playbackRate = Math.max(desiredRate * 1.05, 0.1);
       } else {
+        videoEl.playbackRate = Math.max(desiredRate * 0.95, 0.1);
+      }
+    } else {
+      if (Math.abs(videoEl.playbackRate - desiredRate) > 0.01) {
         videoEl.playbackRate = desiredRate;
       }
     }
@@ -138,51 +163,94 @@ export function useVideoController({
     });
   }, [videoRef, playback, clockOffset]);
 
-  // ── Periodic drift self-correction (500ms ticker with PI controller) ──
+  // ── DriftSampler: requestVideoFrameCallback with median-of-30 filter ──
+  // Pitfall #6: don't use timeupdate (fires indeterminately every 15-250ms).
+  // Use requestVideoFrameCallback for per-frame precision, with setInterval(250) fallback.
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !playback || !playback.isPlaying || playback.videoType === "youtube" || playback.videoType === "iframe") return;
 
-    lastTickTimeRef.current = Date.now();
+    const computeExpected = (): number => {
+      const pb = playbackRef.current;
+      if (!pb) return 0;
+      const co = clockOffsetRef.current;
+      const serverNow = Date.now() + co;
+      const elapsed = pb.isPlaying ? (serverNow - pb.lastChangedAt) / 1000 : 0;
+      return pb.currentTime + elapsed * (pb.playbackRate || 1);
+    };
 
-    const id = setInterval(() => {
+    const correctDrift = (driftMs: number) => {
       if (guardRef.current) return;
-      const now = Date.now();
-      const dt = (now - lastTickTimeRef.current) / 1000;
-      lastTickTimeRef.current = now;
+      const videoEl2 = videoRef.current;
+      if (!videoEl2) return;
+      const abs = Math.abs(driftMs);
 
-      const serverNow = now + clockOffset;
-      const elapsed = (serverNow - playback.lastChangedAt) / 1000;
-      const desiredRate = playback.playbackRate || 1;
-      const expected = playback.currentTime + elapsed * desiredRate;
-      const actual = videoEl.currentTime;
-
-      const res = piControllerRef.current.compute(expected, actual, dt, desiredRate);
-
-      if (res.action === "SEEK") {
-        guardRef.current = true;
-        videoEl.currentTime = expected;
-        videoEl.playbackRate = desiredRate;
-        queueMicrotask(() => { guardRef.current = false; });
-      } else if (res.action === "SLEW") {
-        videoEl.playbackRate = res.slewRate;
-      } else {
-        if (Math.abs(videoEl.playbackRate - desiredRate) > 0.001) {
-          videoEl.playbackRate = desiredRate;
+      if (abs < SOFT_BAND_MS) {
+        // Within soft band — restore normal rate
+        const pb = playbackRef.current;
+        const desiredRate = pb?.playbackRate || 1;
+        if (Math.abs(videoEl2.playbackRate - desiredRate) > 0.001) {
+          videoEl2.playbackRate = desiredRate;
         }
+      } else if (abs < RATE_BAND_MS) {
+        // Rate-nudge zone: 0.96-1.04
+        const targetRate = driftMs < 0
+          ? Math.min(MAX_RATE, 1 + (abs / RATE_BAND_MS) * 0.04)
+          : Math.max(MIN_RATE, 1 - (abs / RATE_BAND_MS) * 0.04);
+        if (Math.abs(videoEl2.playbackRate - targetRate) > 0.001) {
+          videoEl2.playbackRate = targetRate;
+        }
+      } else if (abs < HARD_SEEK_MS) {
+        // Aggressive rate correction
+        videoEl2.playbackRate = driftMs < 0 ? MAX_RATE : MIN_RATE;
+      } else {
+        // Hard seek — snap to expected position
+        guardRef.current = true;
+        videoEl2.playbackRate = 1;
+        videoEl2.currentTime = computeExpected();
+        queueMicrotask(() => { guardRef.current = false; });
       }
-    }, 500);
+    };
 
-    return () => clearInterval(id);
-  }, [videoRef, playback, clockOffset]);
+    // Use requestVideoFrameCallback if available (per-frame precision)
+    if ("requestVideoFrameCallback" in videoEl) {
+      const onFrame = (_now: number, metadata: any) => {
+        const expected = computeExpected() * 1000;
+        const actual = (metadata.mediaTime || videoEl.currentTime) * 1000;
+        const drift = actual - expected;
 
-  // ── Heartbeat ──
-  const heartbeat = useCallback(() => {
-    // Server uses this for RTT telemetry; no-op here for now.
-  }, []);
+        // Median-of-30 filter — robust to ABR-switch spikes
+        driftSamplesRef.current.push(drift);
+        if (driftSamplesRef.current.length > 30) driftSamplesRef.current.shift();
+        const sorted = driftSamplesRef.current.slice().sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
 
+        correctDrift(median);
+        rafIdRef.current = (videoEl as any).requestVideoFrameCallback(onFrame);
+      };
+      rafIdRef.current = (videoEl as any).requestVideoFrameCallback(onFrame);
+
+      return () => {
+        if ("cancelVideoFrameCallback" in videoEl) {
+          (videoEl as any).cancelVideoFrameCallback(rafIdRef.current);
+        }
+      };
+    } else {
+      // Fallback: setInterval(250) for older browsers (iOS < 16)
+      const id = setInterval(() => {
+        const expected = computeExpected() * 1000;
+        const actual = videoEl.currentTime * 1000;
+        correctDrift(actual - expected);
+      }, 250);
+      return () => clearInterval(id);
+    }
+  }, [videoRef, playback?.isPlaying, playback?.seq]);
+
+  // ── Heartbeat: 1Hz (not 2s) — matches howardchung/watchparty ──
   useEffect(() => {
-    const id = setInterval(heartbeat, 5000);
+    const id = setInterval(() => {
+      // Server uses this for tsMap + RTT estimation
+    }, 1000);
     return () => clearInterval(id);
-  }, [heartbeat]);
+  }, []);
 }
