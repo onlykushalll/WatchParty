@@ -46,6 +46,7 @@ import {
   Upload,
   ExternalLink,
   Pause,
+  Loader2,
 } from "lucide-react";
 
 // ── Inline theme hook (avoids module resolution issues with Turbopack
@@ -422,9 +423,49 @@ function RoomView({
   const addUrl = () => {
     const u = urlInput.trim();
     if (!u) return;
-    engine.queueAdd(u);
-    setUrlInput("");
-    toast.success("Added to queue");
+    // If it's a streaming site (cinevo, netmirror, etc.), try to extract the video URL
+    if (u.match(/cinevo|netmirror|fmovies|soap2day|putlocker|watchmovies/i)) {
+      extractAndPlay(u);
+    } else {
+      engine.queueAdd(u);
+      setUrlInput("");
+      toast.success("Added to queue");
+    }
+  };
+
+  const [extracting, setExtracting] = useState(false);
+
+  const extractAndPlay = async (url: string) => {
+    setExtracting(true);
+    toast.info("Extracting video stream… (may take 20-30s)");
+    try {
+      const extractorUrl = typeof window !== "undefined" && window.location.hostname === "localhost"
+        ? "http://localhost:3005"
+        : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "extract"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//extract.${window.location.hostname}`; })();
+      const res = await fetch(`${extractorUrl}/extract`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      if (data.ok && data.videoUrls && data.videoUrls.length > 0) {
+        // Find the best URL (prefer .m3u8 for HLS, then .mp4)
+        const hlsUrl = data.videoUrls.find((u: string) => u.includes(".m3u8"));
+        const mp4Url = data.videoUrls.find((u: string) => u.includes(".mp4"));
+        const bestUrl = hlsUrl || mp4Url || data.videoUrls[0];
+        engine.sendIntent({ videoUrl: bestUrl, videoType: hlsUrl ? "hls" : "mp4" });
+        toast.success(`Video extracted! Playing: ${data.title || "movie"}`);
+        setMode("video");
+      } else {
+        toast.error("Could not extract video — try the Watch Together mode");
+      }
+    } catch (e) {
+      toast.error("Extractor service not available — using URL directly");
+      engine.queueAdd(url);
+    } finally {
+      setExtracting(false);
+      setUrlInput("");
+    }
   };
 
   const openExternal = () => {
@@ -511,12 +552,14 @@ function RoomView({
             <Input
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="Paste YouTube/MP4/HLS URL…"
+              placeholder="YouTube, MP4, HLS, or cinevo.nl URL…"
               className="h-7 max-w-xs flex-1 text-xs"
               onKeyDown={(e) => e.key === "Enter" && addUrl()}
+              disabled={extracting}
             />
-            <Button size="sm" className="h-7 gap-1 px-2 text-xs" onClick={addUrl}>
-              <Plus className="h-3 w-3" /> Add
+            <Button size="sm" className="h-7 gap-1 px-2 text-xs" onClick={addUrl} disabled={extracting}>
+              {extracting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
+              {extracting ? "…" : "Add"}
             </Button>
             <label className="flex h-7 cursor-pointer items-center gap-1 rounded-md border bg-card/50 px-2 text-xs font-medium hover:bg-accent">
               <Upload className="h-3 w-3" />

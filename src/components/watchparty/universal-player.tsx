@@ -249,11 +249,12 @@ export function UniversalPlayer({
         <>
           <video
             ref={videoRef}
-            className="h-full w-full bg-black"
+            className="absolute inset-0 h-full w-full bg-black object-contain"
             controls
             playsInline
             onClick={togglePlay}
             onDoubleClick={toggleFullscreen}
+            style={{ objectFit: "contain" }}
           />
           {!ready && !error && (
             <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
@@ -282,89 +283,7 @@ export function UniversalPlayer({
         </div>
       )}
 
-      {/* ── Custom controls (only for native video) ── */}
-      {["hls", "mp4", "webm", "ogg"].includes(videoType) && (
-        <div
-          className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent px-3 pb-2 pt-8 transition-opacity duration-200 ${
-            showControls ? "opacity-100" : "opacity-0"
-          }`}
-        >
-          {/* Progress bar */}
-          <Slider
-            value={[localTime]}
-            max={duration || 0}
-            min={0}
-            step={0.1}
-            onValueChange={onSeek}
-            className="mb-2 cursor-pointer"
-          />
-          <div className="flex items-center gap-2">
-            <Button
-              size="icon"
-              variant="ghost"
-              className="h-8 w-8 text-white hover:bg-white/10"
-              onClick={togglePlay}
-            >
-              {playback.isPlaying ? (
-                <Pause className="h-4 w-4" />
-              ) : (
-                <Play className="h-4 w-4" />
-              )}
-            </Button>
-            {hasNext && (
-              <Button
-                size="icon"
-                variant="ghost"
-                className="h-8 w-8 text-white hover:bg-white/10"
-                onClick={onNext}
-              >
-                <SkipForward className="h-4 w-4" />
-              </Button>
-            )}
-            <div className="flex items-center gap-1">
-              <Button
-                size="icon"
-                variant="ghost"
-                className="h-8 w-8 text-white hover:bg-white/10"
-                onClick={toggleMute}
-              >
-                {muted || volume === 0 ? (
-                  <VolumeX className="h-4 w-4" />
-                ) : (
-                  <Volume2 className="h-4 w-4" />
-                )}
-              </Button>
-              <Slider
-                value={[muted ? 0 : volume * 100]}
-                max={100}
-                step={1}
-                onValueChange={(v) => onVolumeChange(v[0] / 100)}
-                className="w-20"
-              />
-            </div>
-            <span className="ml-1 font-mono text-[11px] text-white/70">
-              {fmtTime(localTime)} / {fmtTime(duration)}
-            </span>
-            <div className="ml-auto flex items-center gap-2">
-              <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[10px] text-emerald-300">
-                ● SYNC
-              </span>
-              <Button
-                size="icon"
-                variant="ghost"
-                className="h-8 w-8 text-white hover:bg-white/10"
-                onClick={toggleFullscreen}
-              >
-                {fullscreen ? (
-                  <Minimize className="h-4 w-4" />
-                ) : (
-                  <Maximize className="h-4 w-4" />
-                )}
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* ── Native video controls handle everything (no custom overlay) ── */}
 
       {/* ── Iframe controls (minimal — we can't control inside iframe) ── */}
       {videoType === "iframe" && (
