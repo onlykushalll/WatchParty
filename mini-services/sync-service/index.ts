@@ -1,17 +1,18 @@
 /**
- * WatchParty Sync Service
- * ------------------------
- * Socket.IO mini-service running on port 3003.
+ * WatchParty Unified Sync & Streaming Service
+ * -------------------------------------------
+ * Socket.IO microservice running on port 3003.
  *
  * Responsibilities:
- *  - Room state (presence, playback, queue, chat relay)
- *  - Cristian's-algorithm clock sync handshake (clock:req / clock:res)
- *  - Server-authoritative playback state with monotonic seq + global
- *    lastChangedAt, so out-of-order packets are discarded and lag is
- *    compensated on the client.
- *  - Periodic heartbeat so new joiners and drifters re-sync.
- *
- * Frontend connects with: io("/?XTransformPort=3003")
+ *  - Authoritative room state (presence, playback, queue, chat, reactions)
+ *  - Cristian's-algorithm clock sync handshake (clock:req / clock:res) with NTP low-RTT filtering
+ *  - Monotonic seq & server-authoritative playback state
+ *  - Command-relay architecture (CMD:play / CMD:pause / CMD:seek / CMD:ts / REC:tsMap)
+ *  - Jellyfin-style buffer-aware group wait (buffer:event)
+ *  - WebRTC mesh signaling relay for live screen / video streaming (rtc:signal / stream:announce)
+ *  - CineVo / third-party extension synchronization (source:set / agent:ad)
+ *  - Virtual Browser floor control queue & normalized cursor forwarding (vm:cursor / vm:control)
+ *  - Opt-in Video Calls & Media State synchronization (media:update)
  */
 
 import { createServer } from "http";
@@ -32,6 +33,10 @@ interface Participant {
   joinedAt: number;
   clockOffset: number; // client time - server time (ms), maintained by clock sync
   rtt: number;
+  isMicMuted?: boolean;
+  isCameraOn?: boolean;
+  cameraPrivacyMode?: "blackout" | "blur" | "avatar";
+  isBuffering?: boolean;
 }
 
 interface PlaybackState {
@@ -39,7 +44,8 @@ interface PlaybackState {
   currentTime: number; // seconds, in the video timeline
   playbackRate: number;
   videoUrl: string;
-  videoType: string; // "youtube" | "hls" | "mp4" | "webm" | "iframe"
+  videoType: string; // "youtube" | "hls" | "mp4" | "webm" | "iframe" | "file" | "torrent"
+  fileName: string; // for "file" mode: the shared filename (blob URLs are NEVER stored)
   lastChangedAt: number; // GLOBAL (server) timestamp ms
   lastChangedBy: string;
   seq: number;
@@ -54,6 +60,12 @@ interface RoomState {
   lastActivity: number;
   vmController: string | null; // userId of current VM controller
   vmControlQueue: string[]; // userIds waiting for control
+  source: { url: string; setBy: string; setAt: number } | null; // Option C: the external URL (e.g. cinevo.nl) agents should open
+  adState: Map<string, boolean>; // socketId -> inAd (agents report ad breaks so server doesn't drift-correct them)
+  tsMap: Record<string, number>; // userId -> normalized timestamp
+  lastTsMap: number; // when we last broadcast tsMap
+  tsInterval?: ReturnType<typeof setInterval>; // 1s tsMap broadcast timer
+  streamHost: { userId: string; fileName: string } | null; // who is streaming via WebRTC
 }
 
 // ─────────────────────────── State ───────────────────────────
@@ -84,6 +96,7 @@ function ensureRoom(roomId: string): RoomState {
         playbackRate: 1,
         videoUrl: "",
         videoType: "",
+        fileName: "",
         lastChangedAt: Date.now(),
         lastChangedBy: "",
         seq: 0,
@@ -93,8 +106,29 @@ function ensureRoom(roomId: string): RoomState {
       lastActivity: Date.now(),
       vmController: null,
       vmControlQueue: [],
+      source: null,
+      adState: new Map(),
+      tsMap: {},
+      lastTsMap: Date.now(),
+      streamHost: null,
     };
     rooms.set(roomId, r);
+
+    // tsMap broadcast interval every 1 second
+    if (!r.tsInterval) {
+      r.tsInterval = setInterval(() => {
+        const room = rooms.get(roomId);
+        if (!room) return;
+        const memberIds = Array.from(room.participants.values()).map((p) => p.userId);
+        Object.keys(room.tsMap).forEach((key) => {
+          if (!memberIds.includes(key)) delete room.tsMap[key];
+        });
+        if (room.playback.videoUrl || room.playback.videoType === "file") {
+          room.lastTsMap = Date.now();
+          io.to(roomId).emit("REC:tsMap", room.tsMap);
+        }
+      }, 1000);
+    }
   }
   return r;
 }
@@ -106,6 +140,9 @@ function publicParticipants(r: RoomState) {
     color: p.color,
     isHost: p.isHost,
     joinedAt: p.joinedAt,
+    isMicMuted: p.isMicMuted,
+    isCameraOn: p.isCameraOn,
+    cameraPrivacyMode: p.cameraPrivacyMode,
   }));
 }
 
@@ -117,24 +154,25 @@ function publicPlayback(r: RoomState) {
     playbackRate: p.playbackRate,
     videoUrl: p.videoUrl,
     videoType: p.videoType,
+    fileName: p.fileName || "",
     lastChangedAt: p.lastChangedAt,
     lastChangedBy: p.lastChangedBy,
     seq: p.seq,
   };
 }
 
-function broadcastPresence(io: Server, r: RoomState) {
-  io.to(r.roomId).emit("presence:update", {
+function broadcastPresence(ioServer: Server, r: RoomState) {
+  ioServer.to(r.roomId).emit("presence:update", {
     participants: publicParticipants(r),
   });
 }
 
-function broadcastPlayback(io: Server, r: RoomState) {
-  io.to(r.roomId).emit("state:sync", publicPlayback(r));
+function broadcastPlayback(ioServer: Server, r: RoomState) {
+  ioServer.to(r.roomId).emit("state:sync", publicPlayback(r));
 }
 
-function broadcastQueue(io: Server, r: RoomState) {
-  io.to(r.roomId).emit("queue:update", {
+function broadcastQueue(ioServer: Server, r: RoomState) {
+  ioServer.to(r.roomId).emit("queue:update", {
     items: r.queue,
     currentIndex: r.currentIndex,
   });
@@ -143,16 +181,17 @@ function broadcastQueue(io: Server, r: RoomState) {
 // ─────────────────────────── Video type detection ───────────────────────────
 
 function detectVideoType(url: string): string {
-  const u = url.toLowerCase().trim();
+  const u = (url || "").toLowerCase().trim();
   if (!u) return "";
   if (/youtube\.com\/watch|youtu\.be\//.test(u)) return "youtube";
   if (/\.m3u8(\?|$)/.test(u)) return "hls";
   if (/\.mp4(\?|$)/.test(u)) return "mp4";
   if (/\.webm(\?|$)/.test(u)) return "webm";
   if (/\.ogg(\?|$)/.test(u)) return "ogg";
+  if (u.startsWith("magnet:") || u.startsWith("webtorrent:")) return "torrent";
   if (/dailymotion\.com/.test(u)) return "dailymotion";
   if (/vimeo\.com/.test(u)) return "vimeo";
-  return "iframe"; // fallback: try to load in an iframe via proxy
+  return "iframe";
 }
 
 // ─────────────────────────── Server ───────────────────────────
@@ -163,8 +202,6 @@ const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingTimeout: 60000,
   pingInterval: 25000,
-  // Connection state recovery — restores client state after brief
-  // disconnections (WiFi blip, tab sleep, etc.) without re-joining.
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
     skipMiddlewares: true,
@@ -176,11 +213,10 @@ io.on("connection", (socket: Socket) => {
   let currentUserId: string | null = null;
 
   // ── Clock sync (Cristian's algorithm) ──
-  socket.on("clock:req", (payload: { t1: number }) => {
+  socket.on("clock:req", (payload: { t1: number; t0?: number }) => {
     const t2 = Date.now();
-    // Small artificial delay simulates processing; t3 is when we send back.
     const t3 = Date.now();
-    socket.emit("clock:res", { t1: payload.t1, t2, t3 });
+    socket.emit("clock:res", { t1: payload.t1, t2, t3, t0: payload.t0 });
   });
 
   // ── Join room ──
@@ -191,7 +227,6 @@ io.on("connection", (socket: Socket) => {
         socket.emit("error", { message: "Invalid join payload" });
         return;
       }
-      // Leave any previous room.
       if (currentRoomId) socket.leave(currentRoomId);
 
       const roomId = payload.roomId;
@@ -203,7 +238,7 @@ io.on("connection", (socket: Socket) => {
         userId: payload.userId,
         name: payload.name.slice(0, 32),
         color: pickColor(),
-        isHost: isFirst, // first joiner becomes host
+        isHost: isFirst,
         joinedAt: Date.now(),
         clockOffset: 0,
         rtt: 0,
@@ -227,7 +262,23 @@ io.on("connection", (socket: Socket) => {
         participants: publicParticipants(r),
         playback: publicPlayback(r),
         queue: { items: r.queue, currentIndex: r.currentIndex },
+        source: r.source,
+        tsMap: r.tsMap,
       });
+
+      socket.emit("REC:tsMap", r.tsMap);
+
+      if (r.streamHost) {
+        socket.emit("stream:announce", {
+          userId: r.streamHost.userId,
+          streaming: true,
+          fileName: r.streamHost.fileName,
+        });
+      }
+
+      if (r.source) {
+        socket.emit("source:set", r.source);
+      }
 
       broadcastPresence(io, r);
       io.to(roomId).emit("chat:system", {
@@ -246,6 +297,7 @@ io.on("connection", (socket: Socket) => {
       playbackRate?: number;
       videoUrl?: string;
       videoType?: string;
+      fileName?: string;
       seq?: number;
     }) => {
       if (!currentRoomId) return;
@@ -254,30 +306,45 @@ io.on("connection", (socket: Socket) => {
       const me = r.participants.get(socket.id);
       if (!me) return;
 
-      // Out-of-order guard: ignore stale seqs.
       if (payload.seq !== undefined && payload.seq < r.playback.seq) return;
 
-      // (Optional) host-lock could go here. For now anyone may control.
+      // Strip blob URLs aggressively
+      if (payload.videoUrl && payload.videoUrl.startsWith("blob:")) {
+        payload.videoUrl = "file://local";
+        payload.videoType = "file";
+      }
 
       const now = Date.now();
       const p = r.playback;
 
-      // Project currentTime forward to "now" if we were playing, so the
-      // incoming intent is interpreted at the right moment.
       let projectedTime = p.currentTime;
-      if (p.isPlaying && p.videoUrl) {
+      if (p.isPlaying && (p.videoUrl || p.videoType === "file")) {
         projectedTime = p.currentTime + (now - p.lastChangedAt) / 1000;
       }
 
       let changed = false;
-      if (payload.videoUrl !== undefined && payload.videoUrl !== p.videoUrl) {
-        p.videoUrl = payload.videoUrl;
-        p.videoType =
-          payload.videoType || detectVideoType(payload.videoUrl);
+      const incomingUrl = payload.videoUrl;
+      const incomingType = payload.videoType;
+      const isFileMode = incomingType === "file" || incomingUrl === "file://local";
+
+      if (isFileMode) {
+        if (p.videoType !== "file" || (payload.fileName && payload.fileName !== p.fileName)) {
+          p.videoType = "file";
+          p.videoUrl = "";
+          if (payload.fileName) p.fileName = payload.fileName;
+          projectedTime = 0;
+          p.isPlaying = false;
+          changed = true;
+        }
+      } else if (incomingUrl !== undefined && incomingUrl !== p.videoUrl) {
+        p.videoUrl = incomingUrl;
+        p.videoType = incomingType || detectVideoType(incomingUrl);
+        p.fileName = "";
         projectedTime = 0;
         p.isPlaying = false;
         changed = true;
       }
+
       if (payload.isPlaying !== undefined && payload.isPlaying !== p.isPlaying) {
         p.isPlaying = payload.isPlaying;
         changed = true;
@@ -296,27 +363,73 @@ io.on("connection", (socket: Socket) => {
 
       if (changed) {
         p.currentTime = projectedTime;
-        // Future-date play commands: delay by max(highestPing×2, 500ms)
-        // so all clients start at the same wall-clock instant (Jellyfin SyncPlay pattern)
-        if (payload.isPlaying === true) {
-          let highestRtt = 0;
-          for (const participant of r.participants.values()) {
-            highestRtt = Math.max(highestRtt, participant.rtt || 50);
-          }
-          p.lastChangedAt = now + Math.max(highestRtt * 2, 500);
-        } else {
-          p.lastChangedAt = now;
-        }
+        p.lastChangedAt = now;
         p.lastChangedBy = me.userId;
         p.seq++;
         r.lastActivity = now;
-        broadcastPlayback(io, r);
+        socket.to(currentRoomId).emit("state:sync", publicPlayback(r));
       }
     },
   );
 
-  // ── Buffer-aware group-wait (Jellyfin SyncPlay pattern) ──
-  // When a client buffers, pause everyone. When all ready, resume.
+  // ── Command-relay events ──
+  socket.on("CMD:play", () => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    r.playback.isPlaying = true;
+    r.playback.lastChangedAt = Date.now();
+    r.playback.lastChangedBy = me.userId;
+    r.playback.seq++;
+    socket.to(currentRoomId).emit("REC:play", { by: me.userId, ts: r.playback.currentTime });
+  });
+
+  socket.on("CMD:pause", () => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    r.playback.isPlaying = false;
+    r.playback.lastChangedAt = Date.now();
+    r.playback.lastChangedBy = me.userId;
+    r.playback.seq++;
+    socket.to(currentRoomId).emit("REC:pause", { by: me.userId, ts: r.playback.currentTime });
+  });
+
+  socket.on("CMD:seek", (data: { time: number; playing: boolean }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    const time = Number(data?.time);
+    if (!isFinite(time) || time < 0) return;
+    r.playback.currentTime = time;
+    r.playback.isPlaying = !!data?.playing;
+    r.playback.lastChangedAt = Date.now();
+    r.playback.lastChangedBy = me.userId;
+    r.playback.seq++;
+    socket.to(currentRoomId).emit("REC:seek", { time, playing: !!data?.playing, by: me.userId });
+  });
+
+  // ── tsMap heartbeat ──
+  socket.on("CMD:ts", (data: { ts: number }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    const ts = Number(data?.ts);
+    if (!isFinite(ts) || ts < 0) return;
+    const timeSinceTsMap = Date.now() - (r.lastTsMap || Date.now());
+    r.tsMap = r.tsMap || {};
+    r.tsMap[me.userId] = ts - timeSinceTsMap / 1000 + 1;
+  });
+
+  // ── Buffer-aware group-wait ──
   socket.on("buffer:event", (payload: { type: "waiting" | "playing"; position: number }) => {
     if (!currentRoomId) return;
     const r = rooms.get(currentRoomId);
@@ -324,10 +437,9 @@ io.on("connection", (socket: Socket) => {
     const me = r.participants.get(socket.id);
     if (!me) return;
 
-    if (me) (me as any).isBuffering = payload.type === "waiting";
+    me.isBuffering = payload.type === "waiting";
 
     if (payload.type === "waiting") {
-      // Someone is buffering — pause everyone else
       const p = r.playback;
       p.isPlaying = false;
       p.currentTime = payload.position;
@@ -340,12 +452,8 @@ io.on("connection", (socket: Socket) => {
         at: Date.now(),
       });
     } else {
-      // Someone finished buffering — check if everyone is ready
-      const allReady = Array.from(r.participants.values()).every(
-        (p) => !(p as any).isBuffering
-      );
-      if (allReady && r.playback.videoUrl) {
-        // Everyone ready — resume with future-dated play
+      const allReady = Array.from(r.participants.values()).every((p) => !p.isBuffering);
+      if (allReady && (r.playback.videoUrl || r.playback.videoType === "file")) {
         const p = r.playback;
         let highestRtt = 0;
         for (const participant of r.participants.values()) {
@@ -364,7 +472,7 @@ io.on("connection", (socket: Socket) => {
     }
   });
 
-  // ── Heartbeat: each client reports its local currentTime periodically ──
+  // ── Heartbeat telemetry ──
   socket.on(
     "heartbeat",
     (payload: { currentTime: number; isPlaying: boolean; clientNow: number }) => {
@@ -373,11 +481,27 @@ io.on("connection", (socket: Socket) => {
       if (!r) return;
       const me = r.participants.get(socket.id);
       if (!me) return;
-      // Track rough RTT via clock sync; just store the reported position.
-      // The server doesn't force-correct here — clients self-correct using
-      // the authoritative state broadcast. This heartbeat is mostly for
-      // presence/latency telemetry.
       me.rtt = Math.abs(payload.clientNow - Date.now());
+    },
+  );
+
+  // ── Media update (Webcam/Mic Calls state) ──
+  socket.on(
+    "media:update",
+    (payload: {
+      isMicMuted?: boolean;
+      isCameraOn?: boolean;
+      cameraPrivacyMode?: "blackout" | "blur" | "avatar";
+    }) => {
+      if (!currentRoomId) return;
+      const r = rooms.get(currentRoomId);
+      if (!r) return;
+      const me = r.participants.get(socket.id);
+      if (!me) return;
+      if (payload.isMicMuted !== undefined) me.isMicMuted = payload.isMicMuted;
+      if (payload.isCameraOn !== undefined) me.isCameraOn = payload.isCameraOn;
+      if (payload.cameraPrivacyMode !== undefined) me.cameraPrivacyMode = payload.cameraPrivacyMode;
+      broadcastPresence(io, r);
     },
   );
 
@@ -400,7 +524,7 @@ io.on("connection", (socket: Socket) => {
     });
   });
 
-  // ── Reactions (emoji rain) ──
+  // ── Reactions ──
   socket.on("reaction", (payload: { emoji: string }) => {
     if (!currentRoomId) return;
     const r = rooms.get(currentRoomId);
@@ -428,7 +552,6 @@ io.on("connection", (socket: Socket) => {
     if (!url) return;
     const type = detectVideoType(url);
     r.queue.push({ url, type, addedBy: me.userId, addedAt: Date.now() });
-    // If nothing is playing, auto-advance and auto-play.
     if (r.currentIndex < 0 || r.currentIndex >= r.queue.length) {
       r.currentIndex = r.queue.length - 1;
       r.playback.videoUrl = url;
@@ -513,6 +636,37 @@ io.on("connection", (socket: Socket) => {
     broadcastQueue(io, r);
   });
 
+  // ── Option C: source URL (cinevo.nl) ──
+  socket.on("source:set", (payload: { url: string }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    const url = (payload?.url || "").toString().trim().slice(0, 2000);
+    if (!url) {
+      r.source = null;
+    } else {
+      r.source = { url, setBy: me.userId, setAt: Date.now() };
+    }
+    io.to(currentRoomId).emit("source:set", r.source);
+  });
+
+  // ── Option C: agent ad-state reporting ──
+  socket.on("agent:ad", (payload: { inAd: boolean }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    r.adState.set(socket.id, !!payload.inAd);
+    const me = r.participants.get(socket.id);
+    if (me && payload.inAd) {
+      io.to(currentRoomId).emit("chat:system", {
+        text: `${me.name} is in an ad break…`,
+        at: Date.now(),
+      });
+    }
+  });
+
   // ── VM cursor + control events ──
   socket.on("vm:cursor", (payload: { x: number; y: number }) => {
     if (!currentRoomId) return;
@@ -520,13 +674,45 @@ io.on("connection", (socket: Socket) => {
     if (!r) return;
     const me = r.participants.get(socket.id);
     if (!me) return;
-    // Broadcast cursor position to everyone EXCEPT sender
     socket.to(currentRoomId).emit("vm:cursor", {
       userId: me.userId,
       name: me.name,
       color: me.color,
       x: payload.x,
       y: payload.y,
+    });
+  });
+
+  // ── WebRTC signaling relay ──
+  socket.on("rtc:signal", (payload: { to: string; msg: any }) => {
+    if (!currentRoomId) return;
+    if (!payload?.to || !payload?.msg) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    socket.to(currentRoomId).emit("rtc:signal", {
+      from: me.userId,
+      msg: payload.msg,
+    });
+  });
+
+  // ── Stream host announcement ──
+  socket.on("stream:announce", (payload: { streaming: boolean; fileName?: string }) => {
+    if (!currentRoomId) return;
+    const r = rooms.get(currentRoomId);
+    if (!r) return;
+    const me = r.participants.get(socket.id);
+    if (!me) return;
+    if (payload.streaming) {
+      r.streamHost = { userId: me.userId, fileName: payload.fileName || "" };
+    } else {
+      r.streamHost = null;
+    }
+    socket.to(currentRoomId).emit("stream:announce", {
+      userId: me.userId,
+      streaming: !!payload.streaming,
+      fileName: payload.fileName || "",
     });
   });
 
@@ -537,7 +723,6 @@ io.on("connection", (socket: Socket) => {
     const me = r.participants.get(socket.id);
     if (!me) return;
     if (!r.vmController) {
-      // Grant immediately if no one has control
       r.vmController = me.userId;
       r.vmControlQueue = r.vmControlQueue.filter((id) => id !== me.userId);
       io.to(currentRoomId).emit("vm:control:granted", { userId: me.userId });
@@ -546,7 +731,6 @@ io.on("connection", (socket: Socket) => {
         queue: r.vmControlQueue,
       });
     } else if (!r.vmControlQueue.includes(me.userId)) {
-      // Add to queue
       r.vmControlQueue.push(me.userId);
       io.to(currentRoomId).emit("vm:control:state", {
         controllerId: r.vmController,
@@ -562,7 +746,6 @@ io.on("connection", (socket: Socket) => {
     const me = r.participants.get(socket.id);
     if (!me) return;
     if (r.vmController === me.userId) {
-      // Grant to next in queue
       r.vmController = r.vmControlQueue.shift() || null;
       io.to(currentRoomId).emit("vm:control:granted", { userId: r.vmController });
       io.to(currentRoomId).emit("vm:control:state", {
@@ -579,36 +762,43 @@ io.on("connection", (socket: Socket) => {
     if (!r) return;
     const me = r.participants.get(socket.id);
     r.participants.delete(socket.id);
+    r.adState.delete(socket.id);
     if (me) {
+      delete r.tsMap[me.userId];
+      if (r.streamHost && r.streamHost.userId === me.userId) {
+        r.streamHost = null;
+        io.to(currentRoomId).emit("stream:announce", {
+          userId: me.userId,
+          streaming: false,
+        });
+      }
       io.to(currentRoomId).emit("chat:system", {
         text: `${me.name} left`,
         at: Date.now(),
       });
-      // If host left, promote the next person.
       if (me.isHost && r.participants.size > 0) {
         const next = Array.from(r.participants.values())[0];
         next.isHost = true;
       }
       broadcastPresence(io, r);
     }
-    // Schedule cleanup if empty.
-    if (r.participants.size === 0) {
+    if (r.participants.size === 0 && currentRoomId) {
+      const roomToClean = currentRoomId;
       setTimeout(() => {
-        const stillEmpty = rooms.get(currentRoomId);
+        const stillEmpty = rooms.get(roomToClean);
         if (
           stillEmpty &&
           stillEmpty.participants.size === 0 &&
           Date.now() - stillEmpty.lastActivity > ROOM_EXPIRY_MS
         ) {
-          rooms.delete(currentRoomId!);
+          if (stillEmpty.tsInterval) clearInterval(stillEmpty.tsInterval);
+          rooms.delete(roomToClean);
         }
       }, ROOM_EXPIRY_MS);
     }
   });
 });
 
-// Heartbeat: broadcast current authoritative state every HEARTBEAT_MS so
-// late joiners / drifted clients re-sync automatically.
 setInterval(() => {
   for (const r of rooms.values()) {
     if (r.participants.size > 0) {

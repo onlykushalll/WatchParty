@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body {
+      width: 280px;
+      font-family: -apple-system, system-ui, sans-serif;
+      margin: 0;
+      padding: 14px;
+      background: #0f0f14;
+      color: #fff;
+    }
+    h1 { font-size: 14px; margin: 0 0 10px; font-weight: 700; }
+    .row { display: flex; justify-content: space-between; font-size: 12px; margin: 4px 0; }
+    .label { color: rgba(255,255,255,0.6); }
+    .val { font-variant-numeric: tabular-nums; }
+    .ok { color: #10b981; }
+    .off { color: #ef4444; }
+    a { color: #a78bfa; font-size: 11px; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .hint { font-size: 11px; color: rgba(255,255,255,0.5); margin-top: 10px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>🎬 WatchParty Sync</h1>
+  <div class="row"><span class="label">Status</span><span class="val" id="status">—</span></div>
+  <div class="row"><span class="label">Room</span><span class="val" id="room">—</span></div>
+  <div class="row"><span class="label">Viewers</span><span class="val" id="viewers">—</span></div>
+  <div class="row"><span class="label">Drift</span><span class="val" id="drift">—</span></div>
+  <div class="hint">
+    Open <a href="http://localhost:3000" target="_blank">WatchParty</a>,
+    start a room, switch to CineVo mode, and open the movie. This extension
+    auto-activates on cinevo.nl.
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

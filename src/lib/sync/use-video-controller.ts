@@ -1,26 +1,33 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, RefObject } from "react";
+import { useEffect, useRef, RefObject } from "react";
 import { PlaybackState } from "./types";
 
 interface UseVideoControllerArgs {
   videoRef: RefObject<HTMLVideoElement | null>;
   playback: PlaybackState | null;
-  clockOffset: number; // serverNow ≈ clientNow + clockOffset
+  clockOffset: number;
   onIntent: (patch: Partial<{
     isPlaying: boolean;
     currentTime: number;
     playbackRate: number;
   }>) => void;
+  cmdPlay?: () => void;
+  cmdPause?: () => void;
+  cmdSeek?: (time: number, playing: boolean) => void;
+  cmdTs?: (ts: number) => void;
+  remoteCmd?: {
+    play: { by: string; ts: number } | null;
+    pause: { by: string; ts: number } | null;
+    seek: { time: number; playing: boolean; by: string } | null;
+  };
+  tsMap?: Record<string, number>;
+  userId?: string;
 }
 
-// ─── DriftCorrector: 3-band correction with preservesPitch ─────────────────
-// Based on the research report's reference implementation.
-// Bands: ±125ms soft (do nothing), ±750ms rate-nudge (0.96-1.04), ±1500ms hard seek.
-
-const SOFT_BAND_MS = 125;      // ITU-R BT.1359 detectability threshold
-const RATE_BAND_MS = 750;      // rate-nudge zone
-const HARD_SEEK_MS = 1500;     // hard seek zone
+const SOFT_BAND_MS = 125;
+const RATE_BAND_MS = 750;
+const HARD_SEEK_MS = 1500;
 const MIN_RATE = 0.96;
 const MAX_RATE = 1.04;
 
@@ -29,10 +36,20 @@ export function useVideoController({
   playback,
   clockOffset,
   onIntent,
+  cmdPlay,
+  cmdPause,
+  cmdSeek,
+  cmdTs,
+  remoteCmd,
+  tsMap,
+  userId,
 }: UseVideoControllerArgs) {
   const guardRef = useRef(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAppliedSeq = useRef(-1);
+  const lastAppliedPlay = useRef<string | null>(null);
+  const lastAppliedPause = useRef<string | null>(null);
+  const lastAppliedSeek = useRef<string | null>(null);
   const driftSamplesRef = useRef<number[]>([]);
   const rafIdRef = useRef<number>(0);
   const clockOffsetRef = useRef(clockOffset);
@@ -40,7 +57,7 @@ export function useVideoController({
   const playbackRef = useRef(playback);
   playbackRef.current = playback;
 
-  // Set preservesPitch to prevent audio pitch distortion during rate nudging
+  // Set preservesPitch
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl) return;
@@ -48,11 +65,48 @@ export function useVideoController({
     try { (videoEl as any).webkitPreservesPitch = true; } catch {}
   }, [videoRef]);
 
-  // ── Outgoing: listen to user-driven events on the video element ──
-  // Based on pitfall fixes from the research:
-  // #1: guard flag prevents feedback loops
-  // #2: debounce prevents seek firing 3 events
-  // #3: DON'T broadcast ratechange (local correction only)
+  // ── Apply remote commands (REC:play/pause/seek) ──
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl || !remoteCmd) return;
+
+    if (remoteCmd.play) {
+      const key = remoteCmd.play.by + ":" + remoteCmd.play.ts;
+      if (lastAppliedPlay.current !== key) {
+        lastAppliedPlay.current = key;
+        if (videoEl.paused) {
+          videoEl.play().catch(() => {
+            videoEl.muted = true;
+            videoEl.play().catch(() => {});
+          });
+        }
+      }
+    }
+    if (remoteCmd.pause) {
+      const key = remoteCmd.pause.by + ":" + remoteCmd.pause.ts;
+      if (lastAppliedPause.current !== key) {
+        lastAppliedPause.current = key;
+        if (!videoEl.paused) videoEl.pause();
+      }
+    }
+    if (remoteCmd.seek) {
+      const key = remoteCmd.seek.by + ":" + remoteCmd.seek.time;
+      if (lastAppliedSeek.current !== key) {
+        lastAppliedSeek.current = key;
+        try { videoEl.currentTime = remoteCmd.seek.time; } catch {}
+        if (remoteCmd.seek.playing && videoEl.paused) {
+          videoEl.play().catch(() => {
+            videoEl.muted = true;
+            videoEl.play().catch(() => {});
+          });
+        } else if (!remoteCmd.seek.playing && !videoEl.paused) {
+          videoEl.pause();
+        }
+      }
+    }
+  }, [videoRef, remoteCmd]);
+
+  // ── Outgoing events ──
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl) return;
@@ -66,43 +120,43 @@ export function useVideoController({
     };
 
     const onPlay = () => {
+      if (cmdPlay) cmdPlay();
       if (guardRef.current) return;
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(flush, 200);
     };
+
     const onPause = () => {
+      if (cmdPause) cmdPause();
       if (guardRef.current) return;
       if (debounceRef.current) clearTimeout(debounceRef.current);
       onIntent({ isPlaying: false, currentTime: videoEl.currentTime });
     };
+
     const onSeeked = () => {
+      if (cmdSeek) cmdSeek(videoEl.currentTime, !videoEl.paused);
       if (guardRef.current) return;
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(flush, 120);
     };
-    // Pitfall #3: DO NOT broadcast ratechange events.
-    // Rate changes are local drift correction only — broadcasting them
-    // causes runaway feedback. So we deliberately omit the ratechange listener.
 
-    videoEl.addEventListener("play", onPlay);
-    videoEl.addEventListener("pause", onPause);
-    videoEl.addEventListener("seeked", onSeeked);
-
-    // Pitfall #9: buffer-aware sync — emit buffer events to server
-    // so it can pause everyone when someone buffers (Jellyfin SyncPlay pattern)
     const onWaiting = () => {
       if (guardRef.current) return;
-      // Emit buffer:event via a custom event that the sync engine picks up
       window.dispatchEvent(new CustomEvent("wp:buffer", {
         detail: { type: "waiting", position: videoEl.currentTime }
       }));
     };
+
     const onPlaying = () => {
       if (guardRef.current) return;
       window.dispatchEvent(new CustomEvent("wp:buffer", {
         detail: { type: "playing", position: videoEl.currentTime }
       }));
     };
+
+    videoEl.addEventListener("play", onPlay);
+    videoEl.addEventListener("pause", onPause);
+    videoEl.addEventListener("seeked", onSeeked);
     videoEl.addEventListener("waiting", onWaiting);
     videoEl.addEventListener("playing", onPlaying);
 
@@ -114,9 +168,9 @@ export function useVideoController({
       videoEl.removeEventListener("playing", onPlaying);
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [videoRef, onIntent]);
+  }, [videoRef, onIntent, cmdPlay, cmdPause, cmdSeek]);
 
-  // ── Incoming: apply authoritative state to the video element ──
+  // ── Apply authoritative playback state ──
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !playback || playback.videoType === "youtube" || playback.videoType === "iframe") return;
@@ -128,7 +182,6 @@ export function useVideoController({
     const desiredRate = playback.playbackRate || 1;
     videoEl.playbackRate = desiredRate;
 
-    // Pitfall #4: use performance.now()-based clock, not Date.now()
     const serverNow = Date.now() + clockOffset;
     const elapsedSinceChange = playback.isPlaying
       ? (serverNow - playback.lastChangedAt) / 1000
@@ -163,9 +216,54 @@ export function useVideoController({
     });
   }, [videoRef, playback, clockOffset]);
 
-  // ── DriftSampler: requestVideoFrameCallback with median-of-30 filter ──
-  // Pitfall #6: don't use timeupdate (fires indeterminately every 15-250ms).
-  // Use requestVideoFrameCallback for per-frame precision, with setInterval(250) fallback.
+  // ── tsMap heartbeat ──
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl || !cmdTs) return;
+    const id = setInterval(() => {
+      if (videoEl.readyState >= 1) {
+        cmdTs(videoEl.currentTime);
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [videoRef, cmdTs]);
+
+  // ── tsMap median drift corrector fallback ──
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl || !tsMap || !userId || !playback) return;
+    const id = setInterval(() => {
+      if (!videoEl || videoEl.paused || videoEl.readyState < 2) return;
+      const others = Object.entries(tsMap)
+        .filter(([uid]) => uid !== userId)
+        .map(([, ts]) => ts)
+        .filter((ts) => isFinite(ts) && ts > 0);
+      if (others.length === 0) return;
+      others.sort((a, b) => a - b);
+      const median = others[Math.floor(others.length / 2)];
+      const myTs = videoEl.currentTime;
+      const drift = median - myTs;
+      const driftMs = Math.abs(drift) * 1000;
+
+      if (driftMs > 3000) {
+        try { videoEl.currentTime = median; } catch {}
+      } else if (driftMs > RATE_BAND_MS) {
+        const targetRate = drift > 0 ? MAX_RATE : MIN_RATE;
+        if (Math.abs(videoEl.playbackRate - targetRate) > 0.01) {
+          videoEl.playbackRate = targetRate;
+          (videoEl as any).preservesPitch = true;
+        }
+      } else {
+        const desired = playback.playbackRate || 1;
+        if (Math.abs(videoEl.playbackRate - desired) > 0.01) {
+          videoEl.playbackRate = desired;
+        }
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [videoRef, tsMap, userId, playback]);
+
+  // ── Precision frame drift sampler (requestVideoFrameCallback) ──
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !playback || !playback.isPlaying || playback.videoType === "youtube" || playback.videoType === "iframe") return;
@@ -186,14 +284,12 @@ export function useVideoController({
       const abs = Math.abs(driftMs);
 
       if (abs < SOFT_BAND_MS) {
-        // Within soft band — restore normal rate
         const pb = playbackRef.current;
         const desiredRate = pb?.playbackRate || 1;
         if (Math.abs(videoEl2.playbackRate - desiredRate) > 0.001) {
           videoEl2.playbackRate = desiredRate;
         }
       } else if (abs < RATE_BAND_MS) {
-        // Rate-nudge zone: 0.96-1.04
         const targetRate = driftMs < 0
           ? Math.min(MAX_RATE, 1 + (abs / RATE_BAND_MS) * 0.04)
           : Math.max(MIN_RATE, 1 - (abs / RATE_BAND_MS) * 0.04);
@@ -201,10 +297,8 @@ export function useVideoController({
           videoEl2.playbackRate = targetRate;
         }
       } else if (abs < HARD_SEEK_MS) {
-        // Aggressive rate correction
         videoEl2.playbackRate = driftMs < 0 ? MAX_RATE : MIN_RATE;
       } else {
-        // Hard seek — snap to expected position
         guardRef.current = true;
         videoEl2.playbackRate = 1;
         videoEl2.currentTime = computeExpected();
@@ -212,14 +306,12 @@ export function useVideoController({
       }
     };
 
-    // Use requestVideoFrameCallback if available (per-frame precision)
     if ("requestVideoFrameCallback" in videoEl) {
       const onFrame = (_now: number, metadata: any) => {
         const expected = computeExpected() * 1000;
         const actual = (metadata.mediaTime || videoEl.currentTime) * 1000;
         const drift = actual - expected;
 
-        // Median-of-30 filter — robust to ABR-switch spikes
         driftSamplesRef.current.push(drift);
         if (driftSamplesRef.current.length > 30) driftSamplesRef.current.shift();
         const sorted = driftSamplesRef.current.slice().sort((a, b) => a - b);
@@ -236,21 +328,14 @@ export function useVideoController({
         }
       };
     } else {
-      // Fallback: setInterval(250) for older browsers (iOS < 16)
       const id = setInterval(() => {
+        const v = videoRef.current;
+        if (!v) return;
         const expected = computeExpected() * 1000;
-        const actual = videoEl.currentTime * 1000;
+        const actual = v.currentTime * 1000;
         correctDrift(actual - expected);
       }, 250);
       return () => clearInterval(id);
     }
   }, [videoRef, playback?.isPlaying, playback?.seq]);
-
-  // ── Heartbeat: 1Hz (not 2s) — matches howardchung/watchparty ──
-  useEffect(() => {
-    const id = setInterval(() => {
-      // Server uses this for tsMap + RTT estimation
-    }, 1000);
-    return () => clearInterval(id);
-  }, []);
 }

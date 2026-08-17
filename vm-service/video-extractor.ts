@@ -58,6 +58,7 @@ async function extractVideoUrl(targetUrl: string): Promise<{
   title: string;
 }> {
   if (!page) throw new Error("Browser not ready");
+  const p = page;
 
   const foundUrls: string[] = [];
 
@@ -87,7 +88,7 @@ async function extractVideoUrl(targetUrl: string): Promise<{
   // Also check for video src in the page
   const checkVideoSrc = async () => {
     try {
-      const srcs = await page.evaluate(() => {
+      const srcs = await p.evaluate(() => {
         const videos = document.querySelectorAll("video");
         const sources = document.querySelectorAll("source");
         const all = [...videos, ...sources];
@@ -104,14 +105,14 @@ async function extractVideoUrl(targetUrl: string): Promise<{
 
   // Navigate to the target URL
   console.log("[extract] Navigating to:", targetUrl);
-  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+  await p.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
 
   // Wait for Cloudflare check to pass (up to 20s)
   console.log("[extract] Waiting for Cloudflare / page load…");
   await new Promise((r) => setTimeout(r, 5000));
 
   // Check if we're still on Cloudflare challenge
-  const isCloudflare = await page.evaluate(() => {
+  const isCloudflare = await p.evaluate(() => {
     return document.title.includes("Just a moment") || document.body?.textContent?.includes("Verifying") || false;
   }).catch(() => false);
 
@@ -126,7 +127,7 @@ async function extractVideoUrl(targetUrl: string): Promise<{
   // Try clicking play button to trigger video loading
   console.log("[extract] Looking for play button…");
   try {
-    await page.evaluate(() => {
+    await p.evaluate(() => {
       // Try various play button selectors
       const selectors = [
         ".play", ".vjs-big-play-button", "[class*=play]", "button[class*=Play]",
@@ -155,7 +156,7 @@ async function extractVideoUrl(targetUrl: string): Promise<{
 
   // Also intercept XHR/fetch responses for m3u8 content
   try {
-    const scripts = await page.evaluate(() => {
+    const scripts = await p.evaluate(() => {
       // Look for any data attributes or script content containing m3u8
       const html = document.documentElement.innerHTML;
       const matches = html.match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/gi);
@@ -170,7 +171,7 @@ async function extractVideoUrl(targetUrl: string): Promise<{
   } catch {}
 
   // Get page title
-  const title = await page.title().catch(() => "");
+  const title = await p.title().catch(() => "");
 
   // Clean up
   cdpSession.off("Network.requestWillBeSent", networkHandler);
@@ -178,7 +179,7 @@ async function extractVideoUrl(targetUrl: string): Promise<{
   console.log("[extract] Found", foundUrls.length, "video URLs");
   return {
     videoUrls: foundUrls,
-    pageUrl: page.url(),
+    pageUrl: p.url(),
     title,
   };
 }

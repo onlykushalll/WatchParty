@@ -9,26 +9,19 @@ import {
   Reaction,
 } from "./types";
 
-// Minimal Socket type (avoids importing socket.io-client at build time,
-// which Turbopack can't resolve when the project is in the user's home dir).
 interface Socket {
-  on(event: string, fn: (...args: unknown[]) => void): Socket;
-  on(event: string, fn: (arg: unknown) => void): Socket;
-  emit(event: string, ...args: unknown[]): Socket;
+  on(event: string, fn: (arg: any) => void): Socket;
+  emit(event: string, ...args: any[]): Socket;
   disconnect(): Socket;
   id?: string;
 }
 
 type IoFn = (url: string, opts: Record<string, unknown>) => Socket;
 
-// Load socket.io-client from CDN at runtime (NOT via import, because
-// Turbopack can't resolve the npm package from the home directory).
-// We fetch the script text and eval it to avoid React 19's "script tag"
-// detection that fires when document.createElement('script') is used.
 let ioPromise: Promise<IoFn> | null = null;
 async function getIo(): Promise<IoFn> {
   if (typeof window === "undefined") {
-    return (() => ({})) as IoFn;
+    return (() => ({} as unknown as Socket)) as IoFn;
   }
   const w = window as any;
   if (w.io) return w.io as IoFn;
@@ -36,7 +29,6 @@ async function getIo(): Promise<IoFn> {
     ioPromise = fetch("https://cdn.socket.io/4.8.3/socket.io.min.js")
       .then((r) => r.text())
       .then((code) => {
-        // Execute via new Function to avoid createElement('script')
         new Function(code)();
         if (!w.io) throw new Error("socket.io failed to initialize");
         return w.io as IoFn;
@@ -47,9 +39,9 @@ async function getIo(): Promise<IoFn> {
 
 export interface SyncStats {
   connected: boolean;
-  clockOffset: number; // ms: serverNow ≈ clientNow + clockOffset
-  rtt: number; // ms round-trip time
-  lastDriftMs: number; // estimated drift at last sync
+  clockOffset: number;
+  rtt: number;
+  lastDriftMs: number;
 }
 
 export interface UseSyncEngineArgs {
@@ -75,21 +67,41 @@ export interface SyncEngine {
   messages: ChatMessage[];
   reactions: Reaction[];
   you: Participant | null;
-  // VM cursor + control
   remoteCursors: RemoteCursor[];
   vmController: string | null;
   vmControlQueue: string[];
   sendVmCursor: (x: number, y: number) => void;
   requestVmControl: () => void;
   releaseVmControl: () => void;
-  // Actions
+  sendMediaState: (state: Partial<{
+    isMicMuted: boolean;
+    isCameraOn: boolean;
+    cameraPrivacyMode: "blackout" | "blur" | "avatar";
+  }>) => void;
+  source: { url: string; setBy: string; setAt: number } | null;
+  sendSource: (url: string) => void;
+  localFile: { url: string; name: string } | null;
+  loadLocalFile: (url: string, name: string) => void;
   sendIntent: (patch: Partial<{
     isPlaying: boolean;
     currentTime: number;
     playbackRate: number;
     videoUrl: string;
     videoType: string;
+    fileName?: string;
   }>) => void;
+  cmdPlay: () => void;
+  cmdPause: () => void;
+  cmdSeek: (time: number, playing: boolean) => void;
+  cmdTs: (ts: number) => void;
+  remoteCmd: {
+    play: { by: string; ts: number } | null;
+    pause: { by: string; ts: number } | null;
+    seek: { time: number; playing: boolean; by: string } | null;
+  };
+  tsMap: Record<string, number>;
+  socket: any;
+  streamHost: { userId: string; fileName: string } | null;
   sendChat: (text: string) => void;
   sendReaction: (emoji: string) => void;
   queueAdd: (url: string) => void;
@@ -98,18 +110,6 @@ export interface SyncEngine {
   queueRemove: (index: number) => void;
 }
 
-/**
- * useSyncEngine
- *
- * Connects to the WatchParty sync service (port 3003 via Caddy
- * XTransformPort), performs Cristian's-algorithm clock sync on connect +
- * every 30s, and exposes the authoritative room state plus action
- * senders.
- *
- * NOTE: this hook only carries state. The actual <video> element control
- * (the guard-flag echo-loop fix + 3-tier drift correction) lives in
- * useVideoController, which calls sendIntent / reads playback.
- */
 export function useSyncEngine({
   roomId,
   userId,
@@ -132,12 +132,16 @@ export function useSyncEngine({
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
   const [vmController, setVmController] = useState<string | null>(null);
   const [vmControlQueue, setVmControlQueue] = useState<string[]>([]);
+  const [source, setSource] = useState<{ url: string; setBy: string; setAt: number } | null>(null);
+  const [localFile, setLocalFile] = useState<{ url: string; name: string } | null>(null);
+  const [tsMap, setTsMap] = useState<Record<string, number>>({});
+  const [remoteCmd, setRemoteCmd] = useState<{
+    play: { by: string; ts: number } | null;
+    pause: { by: string; ts: number } | null;
+    seek: { time: number; playing: boolean; by: string } | null;
+  }>({ play: null, pause: null, seek: null });
+  const [streamHost, setStreamHost] = useState<{ userId: string; fileName: string } | null>(null);
 
-  // ── Clock sync (Cristian's algorithm with NTP-style low-RTT filtering) ──
-  // Based on the research report's reference implementation:
-  // - 8-sample sliding window, keep lowest-RTT sample as truth
-  // - 5s cadence (not 30s — catches drift faster)
-  // - Uses performance.now() for monotonic interpolation
   const clockSamplesRef = useRef<Array<{ t0: number; t1: number; serverTime: number }>>([]);
 
   const runClockSync = useCallback((sock: Socket) => {
@@ -145,57 +149,19 @@ export function useSyncEngine({
     sock.emit("clock:req", { t1: Date.now(), t0 });
   }, []);
 
-  // On clock response: compute offset using lowest-RTT sample (NTP-style)
-  const onClockResponse = useCallback((p: { t1: number; t2: number; t3: number }) => {
-    const t4 = performance.now();
-    const rtt = t4 - (p.t1 ? 0 : t4); // t1 was Date.now(), but we use perf.now for t0
-    // Actually use the server's timestamps directly
-    const rttMs = t4 - (p.t1 - Date.now() + performance.now()); // fallback
-    // Simplified: use the server response directly
-    const serverTime = p.t3;
-    const clientTime = Date.now();
-    const offset = serverTime - clientTime;
-    
-    // Store sample
-    clockSamplesRef.current.push({ t0: p.t1, t1: clientTime, serverTime });
-    if (clockSamplesRef.current.length > 8) clockSamplesRef.current.shift();
-    
-    // Sort by RTT ascending, use lowest-RTT sample
-    const sorted = clockSamplesRef.current.slice().sort(
-      (a, b) => (a.t1 - a.t0) - (b.t1 - b.t0)
-    );
-    const best = sorted[0];
-    if (best) {
-      const bestRtt = best.t1 - best.t0;
-      const bestOffset = best.serverTime + bestRtt / 2 - best.t1;
-      setStats((s) => ({
-        ...s,
-        clockOffset: bestOffset,
-        rtt: bestRtt,
-        lastDriftMs: Math.abs(bestOffset),
-      }));
-    }
-  }, []);
-
   useEffect(() => {
     if (!roomId || !userId || !userName) return;
     let cancelled = false;
     let sock: Socket | null = null;
 
-    // Determine the sync socket URL based on where we're running.
-    // Auto-detects: if on a tunnel domain (e.g. wp.example.com), use
-    // sync.example.com. If localhost, use localhost:3003.
     const host = typeof window !== "undefined" ? window.location.hostname : "";
     const proto = typeof window !== "undefined" ? window.location.protocol : "https:";
     let syncUrl: string;
     if (host === "localhost" || host === "127.0.0.1") {
       syncUrl = "http://localhost:3003";
     } else if (host.startsWith("preview-") || host.includes(".space-z.ai")) {
-      // Sandbox preview — use Caddy XTransformPort pattern
       syncUrl = "/?XTransformPort=3003";
     } else {
-      // Production tunnel — derive sync subdomain from host
-      // e.g. wp.kushalneedsmcp.online → sync.kushalneedsmcp.online
       const parts = host.split(".");
       if (parts.length >= 3) {
         parts[0] = "sync";
@@ -204,7 +170,6 @@ export function useSyncEngine({
         syncUrl = `${proto}//sync.${host}`;
       }
     }
-
 
     getIo().then((ioFn) => {
       if (cancelled) return;
@@ -225,24 +190,22 @@ export function useSyncEngine({
         runClockSync(sock!);
       });
 
-      sock.on("disconnect", (reason: string) => {
+      sock.on("disconnect", () => {
         setStats((s) => ({ ...s, connected: false }));
       });
 
-      sock.on("connect_error", (err: Error) => {
+      sock.on("connect_error", () => {
         setStats((s) => ({ ...s, connected: false }));
       });
 
       sock.on("clock:res", (p: { t1: number; t2: number; t3: number }) => {
-        // Use the NTP-style filtered clock sync
         const t4 = Date.now();
         const rtt = t4 - p.t1;
         clockSamplesRef.current.push({ t0: p.t1, t1: t4, serverTime: p.t3 });
         if (clockSamplesRef.current.length > 8) clockSamplesRef.current.shift();
-        
-        // Sort by RTT ascending — lowest RTT is most trustworthy (NTP convention)
+
         const sorted = clockSamplesRef.current.slice().sort(
-          (a, b) => (a.t1 - a.t0) - (b.t1 - b.t0)
+          (a, b) => (a.t1 - a.t0) - (b.t1 - b.t0),
         );
         const best = sorted[0];
         if (best) {
@@ -263,12 +226,16 @@ export function useSyncEngine({
         participants: Participant[];
         playback: PlaybackState;
         queue: { items: QueueItem[]; currentIndex: number };
+        source?: { url: string; setBy: string; setAt: number } | null;
+        tsMap?: Record<string, number>;
       }) => {
         setYou(p.you);
         setParticipants(p.participants);
         setPlayback(p.playback);
         setQueue(p.queue.items);
         setCurrentIndex(p.queue.currentIndex);
+        if (p.source) setSource(p.source);
+        if (p.tsMap) setTsMap(p.tsMap);
       });
 
       sock.on("presence:update", (p: { participants: Participant[] }) => {
@@ -314,13 +281,11 @@ export function useSyncEngine({
         }, 4000);
       });
 
-      // ── VM cursor + control ──
       sock.on("vm:cursor", (c: RemoteCursor) => {
         setRemoteCursors((prev) => {
           const filtered = prev.filter((p) => p.userId !== c.userId);
           return [...filtered, c];
         });
-        // Expire cursor after 5s of no movement
         setTimeout(() => {
           setRemoteCursors((prev) => prev.filter((p) => p !== c));
         }, 5000);
@@ -333,6 +298,31 @@ export function useSyncEngine({
 
       sock.on("vm:control:granted", (s: { userId: string | null }) => {
         setVmController(s.userId);
+      });
+
+      sock.on("source:set", (s: { url: string; setBy: string; setAt: number } | null) => {
+        setSource(s);
+      });
+
+      sock.on("REC:play", (p: { by: string; ts: number }) => {
+        setRemoteCmd((prev) => ({ ...prev, play: p, pause: null }));
+      });
+      sock.on("REC:pause", (p: { by: string; ts: number }) => {
+        setRemoteCmd((prev) => ({ ...prev, play: null, pause: p }));
+      });
+      sock.on("REC:seek", (p: { time: number; playing: boolean; by: string }) => {
+        setRemoteCmd((prev) => ({ ...prev, seek: p }));
+      });
+      sock.on("REC:tsMap", (map: Record<string, number>) => {
+        setTsMap(map);
+      });
+
+      sock.on("stream:announce", (p: { userId: string; streaming: boolean; fileName?: string }) => {
+        if (p.streaming) {
+          setStreamHost({ userId: p.userId, fileName: p.fileName || "" });
+        } else {
+          setStreamHost(null);
+        }
       });
     }).catch((err) => {
       console.error("[sync] failed to load socket.io:", err.message);
@@ -359,11 +349,25 @@ export function useSyncEngine({
       playbackRate: number;
       videoUrl: string;
       videoType: string;
+      fileName?: string;
     }>) => {
       socketRef.current?.emit("state:intent", patch);
     },
     [],
   );
+
+  const cmdPlay = useCallback(() => {
+    socketRef.current?.emit("CMD:play", {});
+  }, []);
+  const cmdPause = useCallback(() => {
+    socketRef.current?.emit("CMD:pause", {});
+  }, []);
+  const cmdSeek = useCallback((time: number, playing: boolean) => {
+    socketRef.current?.emit("CMD:seek", { time, playing });
+  }, []);
+  const cmdTs = useCallback((ts: number) => {
+    socketRef.current?.emit("CMD:ts", { ts });
+  }, []);
 
   const sendChat = useCallback((text: string) => {
     socketRef.current?.emit("chat:send", { text });
@@ -393,7 +397,17 @@ export function useSyncEngine({
     socketRef.current?.emit("vm:cursor", { x, y });
   }, []);
 
-  // Buffer event forwarding — listen for wp:buffer custom events from video controller
+  const sendMediaState = useCallback(
+    (mediaPatch: Partial<{
+      isMicMuted: boolean;
+      isCameraOn: boolean;
+      cameraPrivacyMode: "blackout" | "blur" | "avatar";
+    }>) => {
+      socketRef.current?.emit("media:update", mediaPatch);
+    },
+    [],
+  );
+
   useEffect(() => {
     const onBuffer = (e: Event) => {
       const detail = (e as CustomEvent).detail;
@@ -411,6 +425,19 @@ export function useSyncEngine({
     socketRef.current?.emit("vm:control:release", {});
   }, []);
 
+  const sendSource = useCallback((url: string) => {
+    socketRef.current?.emit("source:set", { url });
+  }, []);
+
+  const loadLocalFile = useCallback((url: string, name: string) => {
+    setLocalFile({ url, name });
+    socketRef.current?.emit("state:intent", {
+      videoUrl: "file://local",
+      videoType: "file",
+      fileName: name,
+    });
+  }, []);
+
   return {
     stats,
     playback,
@@ -426,7 +453,20 @@ export function useSyncEngine({
     sendVmCursor,
     requestVmControl,
     releaseVmControl,
+    sendMediaState,
+    source,
+    sendSource,
+    localFile,
+    loadLocalFile,
     sendIntent,
+    cmdPlay,
+    cmdPause,
+    cmdSeek,
+    cmdTs,
+    remoteCmd,
+    tsMap,
+    socket: socketRef.current,
+    streamHost,
     sendChat,
     sendReaction,
     queueAdd,

@@ -5,7 +5,8 @@ export interface PlaybackState {
   currentTime: number; // seconds
   playbackRate: number;
   videoUrl: string;
-  videoType: string; // "youtube" | "hls" | "mp4" | "webm" | "iframe" | ...
+  videoType: string; // "youtube" | "hls" | "mp4" | "webm" | "iframe" | "file" | "torrent"
+  fileName?: string;
   lastChangedAt: number; // server-global ms timestamp
   lastChangedBy: string;
   seq: number;
@@ -19,7 +20,7 @@ export interface Participant {
   joinedAt: number;
   isMicMuted?: boolean;
   isCameraOn?: boolean;
-  cameraPrivacyMode?: 'blackout' | 'blur' | 'avatar';
+  cameraPrivacyMode?: "blackout" | "blur" | "avatar";
 }
 
 export interface QueueItem {
@@ -54,6 +55,7 @@ export function detectVideoType(url: string): string {
   if (/\.mp4(\?|$)/.test(u)) return "mp4";
   if (/\.webm(\?|$)/.test(u)) return "webm";
   if (/\.ogg(\?|$)/.test(u)) return "ogg";
+  if (u.startsWith("magnet:") || u.startsWith("webtorrent:")) return "torrent";
   if (/vimeo\.com/.test(u)) return "vimeo";
   if (/dailymotion\.com/.test(u)) return "dailymotion";
   if (/twitch\.tv/.test(u)) return "twitch";

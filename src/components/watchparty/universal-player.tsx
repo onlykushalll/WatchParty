@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import Hls from "hls.js";
-import { PlaybackState, detectVideoType, youtubeId } from "@/lib/sync/types";
+import { PlaybackState, youtubeId } from "@/lib/sync/types";
 import { useVideoController } from "@/lib/sync/use-video-controller";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
@@ -17,6 +17,7 @@ import {
   SkipForward,
   AlertCircle,
   ExternalLink,
+  Upload,
 } from "lucide-react";
 
 interface UniversalPlayerProps {
@@ -29,6 +30,19 @@ interface UniversalPlayerProps {
   }>) => void;
   onNext?: () => void;
   hasNext?: boolean;
+  localFile?: { url: string; name: string } | null;
+  onLoadLocalFile?: (url: string, name: string) => void;
+  cmdPlay?: () => void;
+  cmdPause?: () => void;
+  cmdSeek?: (time: number, playing: boolean) => void;
+  cmdTs?: (ts: number) => void;
+  remoteCmd?: {
+    play: { by: string; ts: number } | null;
+    pause: { by: string; ts: number } | null;
+    seek: { time: number; playing: boolean; by: string } | null;
+  };
+  tsMap?: Record<string, number>;
+  userId?: string;
 }
 
 function fmtTime(s: number): string {
@@ -47,9 +61,19 @@ export function UniversalPlayer({
   onIntent,
   onNext,
   hasNext,
+  localFile,
+  onLoadLocalFile,
+  cmdPlay,
+  cmdPause,
+  cmdSeek,
+  cmdTs,
+  remoteCmd,
+  tsMap,
+  userId,
 }: UniversalPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -61,16 +85,25 @@ export function UniversalPlayer({
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const videoType = playback?.videoType || "";
-  const videoUrl = playback?.videoUrl || "";
+  const effectiveVideoUrl = videoType === "file"
+    ? (localFile?.url || "")
+    : (playback?.videoUrl || "");
+  const videoUrl = effectiveVideoUrl;
   const ytid = videoType === "youtube" ? youtubeId(videoUrl) : null;
-  const isNativeVideo = ["mp4", "webm", "hls", "ogg"].includes(videoType);
+  const isNativeVideo = ["mp4", "webm", "hls", "ogg", "file"].includes(videoType);
 
-  // Use the controller for <video>-based sources only.
   useVideoController({
     videoRef,
     playback: isNativeVideo ? playback : null,
     clockOffset,
     onIntent,
+    cmdPlay,
+    cmdPause,
+    cmdSeek,
+    cmdTs,
+    remoteCmd,
+    tsMap,
+    userId,
   });
 
   // ── HLS setup ──
@@ -78,12 +111,10 @@ export function UniversalPlayer({
     if (videoType !== "hls") return;
     const v = videoRef.current;
     if (!v || !videoUrl) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setReady(false);
 
     if (v.canPlayType("application/vnd.apple.mpegurl")) {
-      // Native HLS (Safari).
       v.src = videoUrl;
       v.load();
       const onLoaded = () => setReady(true);
@@ -106,14 +137,13 @@ export function UniversalPlayer({
       };
     }
     setError("HLS not supported in this browser");
-  }, [videoType, videoUrl, videoRef]);
+  }, [videoType, videoUrl]);
 
-  // ── Direct video (mp4/webm/ogg) ──
+  // ── Direct video (mp4/webm/ogg/file) ──
   useEffect(() => {
-    if (!["mp4", "webm", "ogg"].includes(videoType)) return;
+    if (!["mp4", "webm", "ogg", "file"].includes(videoType)) return;
     const v = videoRef.current;
     if (!v || !videoUrl) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setError(null);
     setReady(false);
     v.src = videoUrl;
@@ -123,10 +153,14 @@ export function UniversalPlayer({
       setDuration(v.duration || 0);
     };
     v.addEventListener("loadedmetadata", onLoaded, { once: true });
-    return () => v.removeEventListener("loadedmetadata", onLoaded);
-  }, [videoType, videoUrl, videoRef]);
+    v.addEventListener("canplay", onLoaded, { once: true });
+    return () => {
+      v.removeEventListener("loadedmetadata", onLoaded);
+      v.removeEventListener("canplay", onLoaded);
+    };
+  }, [videoType, videoUrl]);
 
-  // ── Track local time for the progress slider ──
+  // ── Track local time ──
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
@@ -140,9 +174,9 @@ export function UniversalPlayer({
       v.removeEventListener("durationchange", onDur);
       v.removeEventListener("loadedmetadata", onDur);
     };
-  }, [videoRef]);
+  }, []);
 
-  // ── Fullscreen tracking ──
+  // ── Fullscreen ──
   useEffect(() => {
     const onFs = () => setFullscreen(!!document.fullscreenElement);
     document.addEventListener("fullscreenchange", onFs);
@@ -154,11 +188,8 @@ export function UniversalPlayer({
     if (v) {
       if (v.paused) v.play().catch(() => {});
       else v.pause();
-    } else {
-      // YouTube / iframe: send intent only.
-      onIntent({ isPlaying: !playback?.isPlaying });
     }
-  }, [videoRef, onIntent, playback]);
+  }, []);
 
   const toggleMute = useCallback(() => {
     const v = videoRef.current;
@@ -166,63 +197,98 @@ export function UniversalPlayer({
       v.muted = !v.muted;
       setMuted(v.muted);
     }
-  }, [videoRef]);
+  }, []);
 
-  const onVolumeChange = useCallback((vol: number) => {
-    setVolume(vol);
+  const onVolumeChange = useCallback((val: number[]) => {
     const v = videoRef.current;
+    const next = val[0] ?? 1;
+    setVolume(next);
     if (v) {
-      v.volume = vol;
-      v.muted = vol === 0;
-      setMuted(vol === 0);
-    }
-  }, [videoRef]);
-
-  const onSeek = useCallback((val: number[]) => {
-    const t = val[0];
-    const v = videoRef.current;
-    if (v) {
-      v.currentTime = t;
-      setLocalTime(t);
-    }
-    onIntent({ currentTime: t });
-  }, [videoRef, onIntent]);
-
-  const toggleFullscreen = useCallback(() => {
-    if (!document.fullscreenElement) {
-      wrapRef.current?.requestFullscreen?.().catch(() => {});
-    } else {
-      document.exitFullscreen?.().catch(() => {});
+      v.volume = next;
+      v.muted = next === 0;
+      setMuted(next === 0);
     }
   }, []);
 
-  // ── Auto-hide controls ──
-  const pokeControls = useCallback(() => {
+  const onSeek = useCallback(
+    (val: number[]) => {
+      const v = videoRef.current;
+      const target = val[0] ?? 0;
+      setLocalTime(target);
+      if (v) {
+        v.currentTime = target;
+      }
+      onIntent({ currentTime: target });
+    },
+    [onIntent],
+  );
+
+  const toggleFullscreen = useCallback(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    if (!document.fullscreenElement) {
+      el.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
+  }, []);
+
+  const bumpControls = useCallback(() => {
     setShowControls(true);
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => {
       if (playback?.isPlaying) setShowControls(false);
-    }, 3000);
+    }, 2800);
   }, [playback?.isPlaying]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    pokeControls();
-  }, [pokeControls, playback?.isPlaying]);
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (f && onLoadLocalFile) {
+      const url = URL.createObjectURL(f);
+      onLoadLocalFile(url, f.name);
+    }
+  };
 
-  // ── Empty state ──
-  if (!playback || !videoUrl) {
+  // ── Render: Empty / File Prompt state ──
+  if (!playback?.videoUrl && videoType !== "file") {
     return (
-      <div className="flex h-full w-full items-center justify-center bg-black">
-        <div className="text-center">
-          <div className="mx-auto mb-3 flex h-16 w-16 items-center justify-center rounded-full bg-white/5">
-            <Play className="h-7 w-7 text-white/30" />
-          </div>
-          <p className="text-sm text-white/40">No video loaded yet</p>
-          <p className="mt-1 text-xs text-white/30">
-            Paste a URL above to start watching together
-          </p>
+      <div className="flex h-full w-full flex-col items-center justify-center p-6 text-center">
+        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+          <Play className="h-8 w-8 fill-current translate-x-0.5" />
         </div>
+        <h3 className="mt-4 text-base font-semibold">No video loaded</h3>
+        <p className="mt-1 max-w-sm text-xs text-muted-foreground">
+          Paste a YouTube, HLS (.m3u8), MP4 link above, or choose a local file to sync with the room.
+        </p>
+      </div>
+    );
+  }
+
+  // ── Render: Local file mode prompt when file is not yet loaded on this client ──
+  if (videoType === "file" && !localFile?.url) {
+    return (
+      <div className="flex h-full w-full flex-col items-center justify-center p-6 text-center bg-zinc-950">
+        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-500">
+          <Upload className="h-8 w-8" />
+        </div>
+        <h3 className="mt-4 text-base font-semibold text-white">Local Movie Sync</h3>
+        <p className="mt-1 max-w-md text-xs text-zinc-400">
+          The host is playing <span className="font-semibold text-amber-400">&ldquo;{playback?.fileName || "a local movie"}&rdquo;</span>.
+          Select your local copy of this file to sync playback perfectly without uploading.
+        </p>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="video/*"
+          className="hidden"
+          onChange={handleFileSelect}
+        />
+        <Button
+          onClick={() => fileInputRef.current?.click()}
+          className="mt-4 gap-2 bg-amber-500 hover:bg-amber-600 text-zinc-950 font-semibold"
+        >
+          <Upload className="h-4 w-4" /> Load Local File
+        </Button>
       </div>
     );
   }
@@ -230,284 +296,149 @@ export function UniversalPlayer({
   return (
     <div
       ref={wrapRef}
-      className="group relative h-full w-full overflow-hidden bg-black"
-      onMouseMove={pokeControls}
-      onMouseLeave={() => playback.isPlaying && setShowControls(false)}
+      onMouseMove={bumpControls}
+      onClick={bumpControls}
+      className="group relative flex h-full w-full items-center justify-center bg-black overflow-hidden select-none"
     >
-      {/* ── YouTube ── */}
-      {videoType === "youtube" && ytid && (
-        <YouTubePlayer
-          videoId={ytid}
-          playback={playback}
-          clockOffset={clockOffset}
-          onIntent={onIntent}
-        />
-      )}
-
-      {/* ── HLS / MP4 / WebM ── */}
-      {["hls", "mp4", "webm", "ogg"].includes(videoType) && (
-        <>
+      {/* ── Strict 16:9 widescreen stage container ── */}
+      <div className="relative w-full h-full max-w-[calc(100vh*16/9)] max-h-[calc(100vw*9/16)] aspect-video flex items-center justify-center bg-black">
+        {videoType === "youtube" && ytid ? (
+          <iframe
+            src={`https://www.youtube-nocookie.com/embed/${ytid}?autoplay=${
+              playback?.isPlaying ? 1 : 0
+            }&start=${Math.floor(playback?.currentTime || 0)}&enablejsapi=1&controls=1`}
+            title="YouTube Player"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            className="h-full w-full border-0 pointer-events-auto"
+          />
+        ) : isNativeVideo ? (
           <video
             ref={videoRef}
-            className="absolute inset-0 h-full w-full bg-black object-contain"
-            controls
             playsInline
+            className="h-full w-full object-contain pointer-events-auto cursor-pointer"
             onClick={togglePlay}
-            onDoubleClick={toggleFullscreen}
-            style={{ objectFit: "contain" }}
           />
-          {!ready && !error && (
-            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
-              <Loader2 className="h-8 w-8 animate-spin text-white/70" />
+        ) : (
+          <iframe
+            src={`/api/proxy?url=${encodeURIComponent(videoUrl)}`}
+            title="Embedded Player"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
+            allow="autoplay; fullscreen; encrypted-media"
+            className="h-full w-full border-0"
+          />
+        )}
+
+        {/* Error overlay */}
+        {error && (
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/80 p-4 text-center">
+            <AlertCircle className="h-8 w-8 text-destructive" />
+            <p className="mt-2 text-xs font-medium text-destructive">{error}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3 text-xs"
+              onClick={() => window.open(videoUrl, "_blank")}
+            >
+              <ExternalLink className="mr-1.5 h-3 w-3" /> Open directly
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* ── Floating Controls Bar (Native Video) ── */}
+      {isNativeVideo && (
+        <div
+          className={`absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/90 via-black/40 to-transparent p-4 transition-opacity duration-300 ${
+            showControls ? "opacity-100" : "opacity-0 pointer-events-none"
+          }`}
+        >
+          {/* Timeline scrubber */}
+          <div className="mb-2 flex items-center gap-2">
+            <span className="text-[11px] font-mono text-zinc-300">
+              {fmtTime(localTime)}
+            </span>
+            <Slider
+              value={[localTime]}
+              max={duration > 0 ? duration : 100}
+              step={0.5}
+              onValueChange={onSeek}
+              className="flex-1 cursor-pointer"
+            />
+            <span className="text-[11px] font-mono text-zinc-400">
+              {fmtTime(duration)}
+            </span>
+          </div>
+
+          {/* Action buttons */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 text-white hover:bg-white/20"
+                onClick={togglePlay}
+              >
+                {playback?.isPlaying ? (
+                  <Pause className="h-4 w-4 fill-current" />
+                ) : (
+                  <Play className="h-4 w-4 fill-current" />
+                )}
+              </Button>
+
+              {hasNext && onNext && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 text-white hover:bg-white/20"
+                  onClick={onNext}
+                >
+                  <SkipForward className="h-4 w-4" />
+                </Button>
+              )}
+
+              <div className="flex items-center gap-1.5 pl-2">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 text-white hover:bg-white/20"
+                  onClick={toggleMute}
+                >
+                  {muted || volume === 0 ? (
+                    <VolumeX className="h-4 w-4" />
+                  ) : (
+                    <Volume2 className="h-4 w-4" />
+                  )}
+                </Button>
+                <div className="w-20">
+                  <Slider
+                    value={[muted ? 0 : volume]}
+                    max={1}
+                    step={0.05}
+                    onValueChange={onVolumeChange}
+                    className="cursor-pointer"
+                  />
+                </div>
+              </div>
             </div>
-          )}
-        </>
-      )}
 
-      {/* ── Iframe portal (any other URL via proxy) ── */}
-      {videoType === "iframe" && (
-        <IframePortal
-          url={videoUrl}
-          onError={setError}
-        />
-      )}
-
-      {/* ── Error overlay ── */}
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80 p-6">
-          <div className="max-w-md text-center">
-            <AlertCircle className="mx-auto mb-3 h-10 w-10 text-rose-400" />
-            <p className="text-sm font-medium text-white">Playback error</p>
-            <p className="mt-1 text-xs text-white/60">{error}</p>
-          </div>
-        </div>
-      )}
-
-      {/* ── Native video controls handle everything (no custom overlay) ── */}
-
-      {/* ── Iframe controls (minimal — we can't control inside iframe) ── */}
-      {videoType === "iframe" && (
-        <div className="absolute right-2 top-2 flex items-center gap-1.5">
-          <a
-            href={videoUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1 rounded-md bg-black/60 px-2 py-1 text-[11px] text-white/80 backdrop-blur hover:bg-black/80"
-          >
-            <ExternalLink className="h-3 w-3" /> open
-          </a>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ─────────────────────────── YouTube ─────────────────────────── */
-
-function YouTubePlayer({
-  videoId,
-  playback,
-  clockOffset,
-  onIntent,
-}: {
-  videoId: string;
-  playback: PlaybackState;
-  clockOffset: number;
-  onIntent: (patch: Partial<{
-    isPlaying: boolean;
-    currentTime: number;
-    playbackRate: number;
-  }>) => void;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const containerId = useRef(`yt-${Math.random().toString(36).slice(2, 8)}`).current;
-  const playerRef = useRef<YT.Player | null>(null);
-  const guardRef = useRef(false);
-  const lastSeq = useRef(-1);
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Keep latest playback + clockOffset in refs so onReady can access them
-  // without being stale (the effect only re-runs on videoId change).
-  const latestPlayback = useRef(playback);
-  const latestClockOffset = useRef(clockOffset);
-  latestPlayback.current = playback;
-  latestClockOffset.current = clockOffset;
-
-  // Load YouTube IFrame API once.
-  useEffect(() => {
-    if (window.YT && window.YT.Player) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setReady(true);
-      return;
-    }
-    // Defer script loading to avoid React 19 "script tag during render" error
-    queueMicrotask(() => {
-      const tag = document.createElement("script");
-      tag.src = "https://www.youtube.com/iframe_api";
-      tag.async = true;
-      document.body.appendChild(tag);
-      (window as any).onYouTubeIframeAPIReady = () => setReady(true);
-    });
-    return () => {
-      // leave the global callback; other components might need it
-    };
-  }, []);
-
-  // Create / refresh player when videoId changes.
-  useEffect(() => {
-    if (!ready || !containerRef.current) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setError(null);
-    guardRef.current = true;
-
-    const el = document.createElement("div");
-    containerRef.current.innerHTML = "";
-    containerRef.current.appendChild(el);
-
-    playerRef.current = new window.YT.Player(el, {
-      videoId,
-      width: "100%",
-      height: "100%",
-      playerVars: {
-        autoplay: 0,
-        controls: 1,
-        disablekb: 0,
-        modestbranding: 1,
-        playsinline: 1,
-        rel: 0,
-        origin: window.location.origin,
-      },
-      events: {
-        onReady: () => {
-          try {
-            const pb = latestPlayback.current;
-            const co = latestClockOffset.current;
-            playerRef.current?.setPlaybackRate(pb.playbackRate || 1);
-            // CRITICAL: immediately sync to current room state so late
-            // joiners land on the same position as everyone else.
-            const serverNow = Date.now() + co;
-            const elapsed = pb.isPlaying
-              ? (serverNow - pb.lastChangedAt) / 1000
-              : 0;
-            const expectedTime = pb.currentTime + elapsed;
-            playerRef.current?.seekTo(expectedTime, true);
-            if (pb.isPlaying) {
-              playerRef.current?.playVideo();
-            } else {
-              playerRef.current?.pauseVideo();
-            }
-            lastSeq.current = pb.seq;
-          } catch {}
-          queueMicrotask(() => { guardRef.current = false; });
-        },
-        onStateChange: (e: YT.OnStateChangeEvent) => {
-          if (guardRef.current) return;
-          const p = playerRef.current;
-          if (!p) return;
-          if (e.data === window.YT.PlayerState.PLAYING) {
-            onIntent({ isPlaying: true, currentTime: p.getCurrentTime() });
-          } else if (e.data === window.YT.PlayerState.PAUSED) {
-            onIntent({ isPlaying: false, currentTime: p.getCurrentTime() });
-          }
-          // BUFFERING (state 3): don't broadcast — let the periodic
-          // drift correction handle re-sync when playback resumes.
-          // The server's heartbeat will keep everyone aligned.
-        },
-        onError: () => setError("YouTube video could not be loaded"),
-      },
-    });
-
-    return () => {
-      try { playerRef.current?.destroy(); } catch {}
-      playerRef.current = null;
-    };
-  }, [ready, videoId]);
-
-  // Apply authoritative state.
-  useEffect(() => {
-    if (!playerRef.current || !ready) return;
-    if (playback.seq === lastSeq.current) return;
-    lastSeq.current = playback.seq;
-
-    guardRef.current = true;
-    const p = playerRef.current;
-    const serverNow = Date.now() + clockOffset;
-    const elapsed = playback.isPlaying ? (serverNow - playback.lastChangedAt) / 1000 : 0;
-    const expected = playback.currentTime + elapsed;
-
-    try {
-      const actual = p.getCurrentTime();
-      if (Math.abs(actual - expected) > 1.0) {
-        p.seekTo(expected, true);
-      }
-      p.setPlaybackRate(playback.playbackRate || 1);
-      if (playback.isPlaying) p.playVideo();
-      else p.pauseVideo();
-    } catch {}
-    queueMicrotask(() => { guardRef.current = false; });
-  }, [playback, clockOffset, ready]);
-
-  // Periodic drift check.
-  useEffect(() => {
-    if (!ready) return;
-    const id = setInterval(() => {
-      const p = playerRef.current;
-      if (!p || guardRef.current || !playback.isPlaying) return;
-      try {
-        const serverNow = Date.now() + clockOffset;
-        const elapsed = (serverNow - playback.lastChangedAt) / 1000;
-        const expected = playback.currentTime + elapsed * (playback.playbackRate || 1);
-        const actual = p.getCurrentTime();
-        if (Math.abs(actual - expected) > 1.5) {
-          guardRef.current = true;
-          p.seekTo(expected, true);
-          queueMicrotask(() => { guardRef.current = false; });
-        }
-      } catch {}
-    }, 2000);
-    return () => clearInterval(id);
-  }, [ready, playback, clockOffset]);
-
-  return (
-    <div className="h-full w-full bg-black">
-      <style>{`#${containerId} iframe { width: 100% !important; height: 100% !important; position: absolute !important; top: 0 !important; left: 0 !important; }`}</style>
-      <div id={containerId} ref={containerRef} className="h-full w-full" />
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80">
-          <div className="text-center">
-            <AlertCircle className="mx-auto mb-3 h-10 w-10 text-rose-400" />
-            <p className="text-sm text-white">{error}</p>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 text-white hover:bg-white/20"
+                onClick={toggleFullscreen}
+              >
+                {fullscreen ? (
+                  <Minimize className="h-4 w-4" />
+                ) : (
+                  <Maximize className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
           </div>
         </div>
       )}
     </div>
   );
-}
-
-/* ─────────────────────────── Iframe portal ─────────────────────────── */
-
-function IframePortal({ url, onError }: { url: string; onError: (e: string) => void }) {
-  // Route through our /api/proxy to strip X-Frame-Options + follow redirects.
-  const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
-  return (
-    <iframe
-      src={proxyUrl}
-      className="h-full w-full border-0 bg-white"
-      allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-      allowFullScreen
-      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
-      onError={() => onError("Failed to load in iframe")}
-      title="Embedded content"
-    />
-  );
-}
-
-/* ─────────────────────────── YT types ─────────────────────────── */
-
-declare global {
-  interface Window {
-    YT: any;
-    onYouTubeIframeAPIReady?: () => void;
-  }
 }

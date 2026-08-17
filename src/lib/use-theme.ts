@@ -5,13 +5,12 @@ import { useEffect, useState } from "react";
 type Theme = "light" | "dark";
 
 export function useTheme() {
-  const [theme, setThemeState] = useState<Theme>("dark");
+  const [theme, setThemeState] = useState<Theme>("light");
 
   useEffect(() => {
-    // Read from localStorage or default to dark
+    // Read from localStorage or default to light
     const stored = localStorage.getItem("theme") as Theme | null;
-    const initial = stored || "dark";
-    // eslint-disable-next-line react-hooks/set-state-in-effect
+    const initial = stored || "light";
     setThemeState(initial);
     if (initial === "dark") {
       document.documentElement.classList.add("dark");
