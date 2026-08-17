@@ -12,9 +12,7 @@ import {
   VolumeX,
   Maximize,
   Upload,
-  Radio,
   Users,
-  Film,
   Globe,
   Loader2,
   AlertCircle,
@@ -173,49 +171,42 @@ export function TorrentPlayer({
   // ── HOST: seed a file when picked ──
   const handleFilePick = useCallback(async (file: File) => {
     setError(null);
-    setStatus("Loading WebTorrent…");
+    setStatus(`Preparing "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
+
+    // 1. Instant 0-second local video playback for host
+    const localUrl = URL.createObjectURL(file);
+    const videoEl = videoRef.current;
+    if (videoEl) {
+      videoEl.src = localUrl;
+      videoEl.load();
+      videoEl.play().catch(() => {});
+    }
+    setReady(true);
+
+    // 2. Start seeding via WebTorrent in background
     try {
       const client = await loadWebTorrent();
-      setStatus(`Seeding "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
-      // Seed the file
+      setStatus(`Seeding "${file.name}"…`);
       client.seed(file, (torrent: any) => {
         seedingRef.current = torrent;
         const magnet = torrent.magnetURI;
         setStatus(`Seeding — ${torrent.numPeers} peer(s) connected`);
         setPeers(torrent.numPeers);
-        // Tell the parent to sync the magnet URI to the room
+        // Sync magnet to room
         onSeedFile?.(magnet, file.name);
-        // Also play locally
-        const videoEl = videoRef.current;
-        if (videoEl) {
-          const fileObj = torrent.files[0];
-          if (fileObj) {
-            if (typeof fileObj.renderTo === "function") {
-              fileObj.renderTo(videoEl, (err: any) => {
-                if (!err) {
-                  setReady(true);
-                  setDuration(videoEl.duration || 0);
-                }
-              });
-            } else if (typeof fileObj.streamTo === "function") {
-              fileObj.streamTo(videoEl).then(() => {
-                setReady(true);
-                setDuration(videoEl.duration || 0);
-              });
-            } else {
-              fileObj.getBlobURL((err: any, url: string) => {
-                if (!err && url) {
-                  videoEl.src = url;
-                  setReady(true);
-                }
-              });
-            }
-          }
-        }
+
+        torrent.on("wire", () => {
+          setPeers(torrent.numPeers);
+          setStatus(`Seeding — ${torrent.numPeers} peer(s) connected`);
+        });
+
+        torrent.on("upload", () => {
+          const speed = Math.round(torrent.uploadSpeed / 1024);
+          setStatus(`Seeding — ${torrent.numPeers} peer(s), ↑ ${speed} KB/s`);
+        });
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to seed file");
-      setStatus("");
+      console.warn("WebTorrent background seed notice:", e);
     }
   }, [onSeedFile]);
 
@@ -230,43 +221,49 @@ export function TorrentPlayer({
 
     loadWebTorrent().then((client) => {
       if (cancelled) return;
-      setStatus("Connecting to peers…");
+      setStatus("Connecting to host swarm…");
 
       // Add the torrent
       const torrent = client.add(magnetURI, (t: any) => {
         if (cancelled) return;
-        setStatus("Downloading media stream…");
+        setStatus("Buffering media stream…");
         const videoEl = videoRef.current;
         if (!videoEl) return;
 
-        // Stream the first file to the video element
-        const file = t.files[0];
+        // Render the largest video file
+        const videoFiles = (t.files || []).filter((f: any) =>
+          f.name.match(/\.(mp4|m4v|webm|mkv|mov|avi|ogv)$/i) || f.name.length > 0,
+        );
+        const file = videoFiles.sort((a: any, b: any) => b.length - a.length)[0] || t.files[0];
+
         if (file) {
-          if (typeof file.renderTo === "function") {
-            file.renderTo(videoEl, (err: any) => {
-              if (cancelled) return;
-              if (!err) {
-                setReady(true);
+          setReady(true);
+          try {
+            if (typeof file.renderTo === "function") {
+              file.renderTo(videoEl, { autoplay: false }, (err: any) => {
+                if (cancelled) return;
+                if (!err) {
+                  setDuration(videoEl.duration || 0);
+                  setStatus(`Streaming — ${t.numPeers} peer(s)`);
+                }
+              });
+            } else if (typeof file.streamTo === "function") {
+              file.streamTo(videoEl).then(() => {
+                if (cancelled) return;
                 setDuration(videoEl.duration || 0);
                 setStatus(`Streaming — ${t.numPeers} peer(s)`);
-              }
-            });
-          } else if (typeof file.streamTo === "function") {
-            file.streamTo(videoEl).then(() => {
-              if (cancelled) return;
-              setReady(true);
-              setDuration(videoEl.duration || 0);
-              setStatus(`Streaming — ${t.numPeers} peer(s)`);
-            });
-          } else {
-            file.getBlobURL((err: any, url: string) => {
-              if (cancelled) return;
-              if (!err && url) {
-                videoEl.src = url;
-                setReady(true);
-                setStatus(`Streaming — ${t.numPeers} peer(s)`);
-              }
-            });
+              });
+            } else {
+              file.getBlobURL((err: any, url: string) => {
+                if (cancelled) return;
+                if (!err && url) {
+                  videoEl.src = url;
+                  setStatus(`Streaming — ${t.numPeers} peer(s)`);
+                }
+              });
+            }
+          } catch (err) {
+            console.error("WebTorrent file render error:", err);
           }
         }
       });
@@ -278,7 +275,7 @@ export function TorrentPlayer({
         if (cancelled) return;
         setProgress(torrent.progress * 100);
         setPeers(torrent.numPeers);
-        setStatus(`Streaming — ${torrent.numPeers} peer(s), ${Math.round(torrent.downloadSpeed / 1024)} KB/s`);
+        setStatus(`Streaming — ${torrent.numPeers} peer(s), ↓ ${Math.round(torrent.downloadSpeed / 1024)} KB/s`);
       });
       torrent.on("wire", () => {
         if (cancelled) return;
@@ -375,7 +372,7 @@ export function TorrentPlayer({
     >
       {/* ── Strict 16:9 widescreen stage container ── */}
       <div className="relative w-full h-full max-w-[calc(100vh*16/9)] max-h-[calc(100vw*9/16)] aspect-video flex items-center justify-center bg-black">
-        {/* Hidden video element that WebTorrent streams into */}
+        {/* Video element */}
         <video
           ref={videoRef}
           playsInline
@@ -477,6 +474,11 @@ export function TorrentPlayer({
           <span className="flex items-center gap-1 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-zinc-300 backdrop-blur">
             <Users className="h-3 w-3" /> {peers} peer(s)
           </span>
+          {status && (
+            <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-emerald-300/90 backdrop-blur">
+              {status}
+            </span>
+          )}
         </div>
       )}
 
