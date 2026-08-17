@@ -16,7 +16,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
-import { FloorControlManager, normalizeCoordinates } from "./index";
+import { FloorControlManager, normalizeCoordinates, sanitizeUrl } from "./index";
 import os from "os";
 import path from "path";
 
@@ -54,10 +54,24 @@ function broadcastControlState() {
   }
 }
 
-function broadcastGrantControl(controllerId: string | null) {
+function broadcastGrantControl(controllerId: string | null, controllerName?: string | null) {
   const msg = Buffer.concat([
     Buffer.from([128]),
-    Buffer.from(JSON.stringify({ controllerId })),
+    Buffer.from(JSON.stringify({ controllerId, controllerName })),
+  ]);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+function broadcastUrl(currentUrl: string) {
+  const urlBuf = Buffer.from(currentUrl, "utf-8");
+  const len = urlBuf.length;
+  const msg = Buffer.concat([
+    Buffer.from([12, (len >> 8) & 0xff, len & 0xff]),
+    urlBuf,
   ]);
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) {
@@ -113,6 +127,13 @@ async function launchBrowser() {
 
   page = (await browser.pages())[0] || (await browser.newPage());
   await page.setViewport({ width: WIDTH, height: HEIGHT });
+
+  // CDP frame navigation push listener
+  page.on("framenavigated", (frame) => {
+    if (page && frame === page.mainFrame()) {
+      broadcastUrl(page.url());
+    }
+  });
 
   // Anti-detection: remove webdriver property
   await page.evaluateOnNewDocument(() => {
@@ -184,7 +205,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       try {
         const { url: navUrl } = JSON.parse(body);
         if (navUrl && page) {
-          await page.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+          const validUrl = sanitizeUrl(navUrl);
+          await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, url: page.url() }));
         } else {
@@ -192,8 +214,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
           res.end(JSON.stringify({ ok: false, error: "Missing url" }));
         }
       } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ ok: false, error: String(e) }));
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: String((e as Error).message || e) }));
       }
     });
     return;
@@ -217,6 +239,10 @@ wss.on("connection", (ws: WebSocket) => {
   console.log(`[vm] WS client connected (${clients.size} total)`);
   if (lastFrame) ws.send(Buffer.concat([Buffer.from([1]), lastFrame]));
 
+  // Send current control state
+  const currentState = floorManager.getControlState();
+  ws.send(Buffer.concat([Buffer.from([129]), Buffer.from(JSON.stringify(currentState))]));
+
   ws.on("message", async (data: Buffer) => {
     if (!page) return;
     try {
@@ -232,7 +258,15 @@ wss.on("connection", (ws: WebSocket) => {
       // Floor Control Messages
       if (type === 16) {
         // request-control
-        const { userId, userName } = payload;
+        let { userId, userName } = payload;
+        if (!userId && data.length >= 2) {
+          const len = data[1];
+          if (data.length >= 2 + len) {
+            userId = data.slice(2, 2 + len).toString("utf-8");
+            userName = userId;
+          }
+        }
+        if (!userId) userId = "user_" + Math.random().toString(36).slice(2, 8);
         const res = floorManager.requestControl(userId, userName || "User", ws);
         if (res.status === "granted") {
           const grantMsg = Buffer.concat([
@@ -245,8 +279,18 @@ wss.on("connection", (ws: WebSocket) => {
         return;
       } else if (type === 17) {
         // release-control
-        const { userId } = payload;
-        const res = floorManager.releaseControl(userId);
+        let { userId } = payload;
+        if (!userId && data.length >= 2) {
+          const len = data[1];
+          if (data.length >= 2 + len) {
+            userId = data.slice(2, 2 + len).toString("utf-8");
+          }
+        }
+        if (!userId) userId = floorManager.getActiveControllerId() || "";
+        const res = floorManager.releaseControl(userId, ws);
+        if (res.status === "unauthorized") {
+          return;
+        }
         if (res.status === "promoted") {
           const grantMsg = Buffer.concat([
             Buffer.from([128]),
@@ -305,35 +349,47 @@ wss.on("connection", (ws: WebSocket) => {
         await page.mouse.wheel({ deltaX: deltaX || 0, deltaY: deltaY || 0 });
       } else if (type === 5) { // Key press
         const { key } = payload;
-        console.log("[vm] key received:", key, "page exists:", !!page);
         if (key && key.length === 1) {
           await page.keyboard.type(key);
-          console.log("[vm] typed:", key);
         } else if (key) {
           await page.keyboard.press(key);
-          console.log("[vm] pressed:", key);
         }
       } else if (type === 6) { // Type text
         const { text } = payload;
         if (text) await page.keyboard.type(text);
       } else if (type === 7) { // Navigate
         const { url } = payload;
-        if (url) await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+        if (url) {
+          const validUrl = sanitizeUrl(url);
+          await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+        }
       } else if (type === 8) { await page.goBack(); }
       else if (type === 9) { await page.goForward(); }
       else if (type === 10) { await page.reload(); }
-      else if (type === 11) { // Evaluate JS on page
-        const { script } = payload;
-        if (script) await page.evaluate(script).catch((e: Error) => console.log("[vm] eval error:", e.message));
+      else if (type === 11) { // Safe evaluate/type handling
+        if (payload.text) {
+          await page.keyboard.type(payload.text);
+        }
       }
     } catch (e) {}
   });
 
   ws.on("close", () => {
-    floorManager.handleDisconnect(ws);
-    broadcastControlState();
     clients.delete(ws);
     console.log(`[vm] WS client disconnected (${clients.size} total)`);
+    const res = floorManager.handleDisconnect(ws);
+    if (res?.status === "promoted") {
+      const grantMsg = Buffer.concat([
+        Buffer.from([128]),
+        Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+      ]);
+      if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+        res.nextSocket.send(grantMsg);
+      }
+    } else if (res?.status === "idle") {
+      broadcastGrantControl(null);
+    }
+    broadcastControlState();
   });
 });
 

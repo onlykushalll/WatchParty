@@ -216,7 +216,7 @@ io.on("connection", (socket: Socket) => {
   socket.on("clock:req", (payload: { t1: number; t0?: number }) => {
     const t2 = Date.now();
     const t3 = Date.now();
-    socket.emit("clock:res", { t1: payload.t1, t2, t3, t0: payload.t0 });
+    socket.emit("clock:res", { t0: payload.t0 ?? payload.t1, t1: payload.t1, t2, t3 });
   });
 
   // ── Join room ──
@@ -475,13 +475,18 @@ io.on("connection", (socket: Socket) => {
   // ── Heartbeat telemetry ──
   socket.on(
     "heartbeat",
-    (payload: { currentTime: number; isPlaying: boolean; clientNow: number }) => {
+    (payload: { currentTime?: number; isPlaying?: boolean; clientNow?: number; rtt?: number; clockOffset?: number }) => {
       if (!currentRoomId) return;
       const r = rooms.get(currentRoomId);
       if (!r) return;
       const me = r.participants.get(socket.id);
       if (!me) return;
-      me.rtt = Math.abs(payload.clientNow - Date.now());
+      if (typeof payload?.rtt === "number" && isFinite(payload.rtt) && payload.rtt >= 0) {
+        me.rtt = Math.min(payload.rtt, 2000);
+      }
+      if (typeof payload?.clockOffset === "number" && isFinite(payload.clockOffset)) {
+        me.clockOffset = payload.clockOffset;
+      }
     },
   );
 
@@ -691,10 +696,28 @@ io.on("connection", (socket: Socket) => {
     if (!r) return;
     const me = r.participants.get(socket.id);
     if (!me) return;
-    socket.to(currentRoomId).emit("rtc:signal", {
-      from: me.userId,
-      msg: payload.msg,
-    });
+
+    let targetSocketId: string | null = null;
+    for (const [sId, p] of r.participants.entries()) {
+      if (p.userId === payload.to) {
+        targetSocketId = sId;
+        break;
+      }
+    }
+
+    if (targetSocketId) {
+      io.to(targetSocketId).emit("rtc:signal", {
+        from: me.userId,
+        to: payload.to,
+        msg: payload.msg,
+      });
+    } else {
+      socket.to(currentRoomId).emit("rtc:signal", {
+        from: me.userId,
+        to: payload.to,
+        msg: payload.msg,
+      });
+    }
   });
 
   // ── Stream host announcement ──
@@ -781,6 +804,27 @@ io.on("connection", (socket: Socket) => {
         next.isHost = true;
       }
       broadcastPresence(io, r);
+
+      // Prevent group buffer deadlock: if disconnected user was buffering, check if remaining members are ready
+      if (r.participants.size > 0 && !r.playback.isPlaying) {
+        const allReady = Array.from(r.participants.values()).every((p) => !p.isBuffering);
+        if (allReady && (r.playback.videoUrl || r.playback.videoType === "file")) {
+          const p = r.playback;
+          let highestRtt = 0;
+          for (const participant of r.participants.values()) {
+            highestRtt = Math.max(highestRtt, participant.rtt || 50);
+          }
+          p.isPlaying = true;
+          p.lastChangedAt = Date.now() + Math.max(highestRtt * 2, 500);
+          p.lastChangedBy = "system";
+          p.seq++;
+          broadcastPlayback(io, r);
+          io.to(currentRoomId).emit("chat:system", {
+            text: `Buffering participant left — resuming playback`,
+            at: Date.now(),
+          });
+        }
+      }
     }
     if (r.participants.size === 0 && currentRoomId) {
       const roomToClean = currentRoomId;

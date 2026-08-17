@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, RefObject } from "react";
 import { PlaybackState } from "./types";
+import { PISlewingController, computeExpectedPlayhead } from "./pi-controller";
 
 interface UseVideoControllerArgs {
   videoRef: RefObject<HTMLVideoElement | null>;
@@ -25,12 +26,6 @@ interface UseVideoControllerArgs {
   userId?: string;
 }
 
-const SOFT_BAND_MS = 125;
-const RATE_BAND_MS = 750;
-const HARD_SEEK_MS = 1500;
-const MIN_RATE = 0.96;
-const MAX_RATE = 1.04;
-
 export function useVideoController({
   videoRef,
   playback,
@@ -50,12 +45,13 @@ export function useVideoController({
   const lastAppliedPlay = useRef<string | null>(null);
   const lastAppliedPause = useRef<string | null>(null);
   const lastAppliedSeek = useRef<string | null>(null);
-  const driftSamplesRef = useRef<number[]>([]);
   const rafIdRef = useRef<number>(0);
   const clockOffsetRef = useRef(clockOffset);
   clockOffsetRef.current = clockOffset;
   const playbackRef = useRef(playback);
   playbackRef.current = playback;
+  const piControllerRef = useRef<PISlewingController>(new PISlewingController());
+  const lastTickTimeRef = useRef<number>(performance.now());
 
   // Set preservesPitch
   useEffect(() => {
@@ -180,29 +176,23 @@ export function useVideoController({
     guardRef.current = true;
 
     const desiredRate = playback.playbackRate || 1;
-    videoEl.playbackRate = desiredRate;
-
-    const serverNow = Date.now() + clockOffset;
-    const elapsedSinceChange = playback.isPlaying
-      ? (serverNow - playback.lastChangedAt) / 1000
-      : 0;
-    const expectedTime = playback.currentTime + elapsedSinceChange;
+    const expectedTime = computeExpectedPlayhead(
+      playback.currentTime,
+      playback.lastChangedAt,
+      Date.now(),
+      clockOffset,
+      desiredRate,
+      playback.isPlaying,
+    );
 
     const actualTime = videoEl.currentTime;
     const delta = Math.abs(actualTime - expectedTime);
 
-    if (delta > 1.5) {
+    // Hard seek if desync exceeds 1.0s or if paused or initial sync
+    if (delta > 1.0 || !playback.isPlaying || lastAppliedSeq.current === 1) {
       videoEl.currentTime = expectedTime;
-    } else if (delta > 0.1) {
-      if (actualTime < expectedTime) {
-        videoEl.playbackRate = Math.max(desiredRate * 1.05, 0.1);
-      } else {
-        videoEl.playbackRate = Math.max(desiredRate * 0.95, 0.1);
-      }
-    } else {
-      if (Math.abs(videoEl.playbackRate - desiredRate) > 0.01) {
-        videoEl.playbackRate = desiredRate;
-      }
+      piControllerRef.current.reset();
+      videoEl.playbackRate = desiredRate;
     }
 
     if (playback.isPlaying && videoEl.paused) {
@@ -211,12 +201,14 @@ export function useVideoController({
       videoEl.pause();
     }
 
+    lastTickTimeRef.current = performance.now();
+
     queueMicrotask(() => {
       guardRef.current = false;
     });
   }, [videoRef, playback, clockOffset]);
 
-  // ── tsMap heartbeat ──
+  // ── tsMap heartbeat broadcast ──
   useEffect(() => {
     const videoEl = videoRef.current;
     if (!videoEl || !cmdTs) return;
@@ -228,96 +220,68 @@ export function useVideoController({
     return () => clearInterval(id);
   }, [videoRef, cmdTs]);
 
-  // ── tsMap median drift corrector fallback ──
+  // ── Unified PI Slewing Rate Controller (Continuous Drift Correction) ──
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (!videoEl || !tsMap || !userId || !playback) return;
-    const id = setInterval(() => {
-      if (!videoEl || videoEl.paused || videoEl.readyState < 2) return;
-      const others = Object.entries(tsMap)
-        .filter(([uid]) => uid !== userId)
-        .map(([, ts]) => ts)
-        .filter((ts) => isFinite(ts) && ts > 0);
-      if (others.length === 0) return;
-      others.sort((a, b) => a - b);
-      const median = others[Math.floor(others.length / 2)];
-      const myTs = videoEl.currentTime;
-      const drift = median - myTs;
-      const driftMs = Math.abs(drift) * 1000;
+    if (
+      !videoEl ||
+      !playback ||
+      !playback.isPlaying ||
+      playback.videoType === "youtube" ||
+      playback.videoType === "iframe"
+    ) {
+      piControllerRef.current.reset();
+      return;
+    }
 
-      if (driftMs > 3000) {
-        try { videoEl.currentTime = median; } catch {}
-      } else if (driftMs > RATE_BAND_MS) {
-        const targetRate = drift > 0 ? MAX_RATE : MIN_RATE;
-        if (Math.abs(videoEl.playbackRate - targetRate) > 0.01) {
-          videoEl.playbackRate = targetRate;
-          (videoEl as any).preservesPitch = true;
-        }
-      } else {
-        const desired = playback.playbackRate || 1;
-        if (Math.abs(videoEl.playbackRate - desired) > 0.01) {
-          videoEl.playbackRate = desired;
-        }
-      }
-    }, 1000);
-    return () => clearInterval(id);
-  }, [videoRef, tsMap, userId, playback]);
+    lastTickTimeRef.current = performance.now();
 
-  // ── Precision frame drift sampler (requestVideoFrameCallback) ──
-  useEffect(() => {
-    const videoEl = videoRef.current;
-    if (!videoEl || !playback || !playback.isPlaying || playback.videoType === "youtube" || playback.videoType === "iframe") return;
-
-    const computeExpected = (): number => {
-      const pb = playbackRef.current;
-      if (!pb) return 0;
-      const co = clockOffsetRef.current;
-      const serverNow = Date.now() + co;
-      const elapsed = pb.isPlaying ? (serverNow - pb.lastChangedAt) / 1000 : 0;
-      return pb.currentTime + elapsed * (pb.playbackRate || 1);
-    };
-
-    const correctDrift = (driftMs: number) => {
+    const runCorrection = (mediaTimeSec?: number) => {
       if (guardRef.current) return;
-      const videoEl2 = videoRef.current;
-      if (!videoEl2) return;
-      const abs = Math.abs(driftMs);
+      const v = videoRef.current;
+      const pb = playbackRef.current;
+      if (!v || !pb || !pb.isPlaying) return;
 
-      if (abs < SOFT_BAND_MS) {
-        const pb = playbackRef.current;
-        const desiredRate = pb?.playbackRate || 1;
-        if (Math.abs(videoEl2.playbackRate - desiredRate) > 0.001) {
-          videoEl2.playbackRate = desiredRate;
-        }
-      } else if (abs < RATE_BAND_MS) {
-        const targetRate = driftMs < 0
-          ? Math.min(MAX_RATE, 1 + (abs / RATE_BAND_MS) * 0.04)
-          : Math.max(MIN_RATE, 1 - (abs / RATE_BAND_MS) * 0.04);
-        if (Math.abs(videoEl2.playbackRate - targetRate) > 0.001) {
-          videoEl2.playbackRate = targetRate;
-        }
-      } else if (abs < HARD_SEEK_MS) {
-        videoEl2.playbackRate = driftMs < 0 ? MAX_RATE : MIN_RATE;
-      } else {
+      const now = performance.now();
+      const dtSec = Math.max(0.01, Math.min(1.0, (now - lastTickTimeRef.current) / 1000));
+      lastTickTimeRef.current = now;
+
+      const desiredRate = pb.playbackRate || 1;
+      const expectedSec = computeExpectedPlayhead(
+        pb.currentTime,
+        pb.lastChangedAt,
+        Date.now(),
+        clockOffsetRef.current,
+        desiredRate,
+        pb.isPlaying,
+      );
+      const actualSec = typeof mediaTimeSec === "number" ? mediaTimeSec : v.currentTime;
+
+      const output = piControllerRef.current.compute(expectedSec, actualSec, dtSec, desiredRate);
+
+      if (output.action === "SEEK") {
         guardRef.current = true;
-        videoEl2.playbackRate = 1;
-        videoEl2.currentTime = computeExpected();
-        queueMicrotask(() => { guardRef.current = false; });
+        v.currentTime = expectedSec;
+        v.playbackRate = desiredRate;
+        queueMicrotask(() => {
+          guardRef.current = false;
+        });
+      } else if (output.action === "SLEW") {
+        if (Math.abs(v.playbackRate - output.slewRate) > 0.001) {
+          v.playbackRate = output.slewRate;
+          (v as any).preservesPitch = true;
+        }
+      } else {
+        // action === "NONE" (within deadband <= 100ms)
+        if (Math.abs(v.playbackRate - desiredRate) > 0.001) {
+          v.playbackRate = desiredRate;
+        }
       }
     };
 
     if ("requestVideoFrameCallback" in videoEl) {
       const onFrame = (_now: number, metadata: any) => {
-        const expected = computeExpected() * 1000;
-        const actual = (metadata.mediaTime || videoEl.currentTime) * 1000;
-        const drift = actual - expected;
-
-        driftSamplesRef.current.push(drift);
-        if (driftSamplesRef.current.length > 30) driftSamplesRef.current.shift();
-        const sorted = driftSamplesRef.current.slice().sort((a, b) => a - b);
-        const median = sorted[Math.floor(sorted.length / 2)];
-
-        correctDrift(median);
+        runCorrection(metadata?.mediaTime);
         rafIdRef.current = (videoEl as any).requestVideoFrameCallback(onFrame);
       };
       rafIdRef.current = (videoEl as any).requestVideoFrameCallback(onFrame);
@@ -329,11 +293,7 @@ export function useVideoController({
       };
     } else {
       const id = setInterval(() => {
-        const v = videoRef.current;
-        if (!v) return;
-        const expected = computeExpected() * 1000;
-        const actual = v.currentTime * 1000;
-        correctDrift(actual - expected);
+        runCorrection();
       }, 250);
       return () => clearInterval(id);
     }

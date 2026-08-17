@@ -16,6 +16,8 @@
   let connected = false;
   let roomCode = '';
   let userName = '';
+  let clockSamples = [];
+  let clockInterval = null;
 
   // Load saved room code + name from storage
   chrome.storage.local.get(['wpRoom', 'wpName'], function(result) {
@@ -97,6 +99,19 @@
     if (overlay) overlay.style.background = color || '#7c3aed';
   }
 
+  function getSyncUrl() {
+    var h = window.location.hostname || '';
+    var proto = window.location.protocol || 'https:';
+    if (h === 'localhost' || h === '127.0.0.1') return 'http://localhost:3003';
+    if (h.startsWith('preview-') || h.includes('.space-z.ai')) return '/?XTransformPort=3003';
+    var p = h.split('.');
+    if (p.length >= 3) {
+      p[0] = 'sync';
+      return proto + '//' + p.join('.');
+    }
+    return proto + '//sync.' + h;
+  }
+
   function connectSync() {
     if (!video) { findVideo(); if (!video) return; }
     if (sock) sock.disconnect();
@@ -114,42 +129,72 @@
     }
   }
 
+  function processClockResponse(p) {
+    var t4 = Date.now();
+    var t0 = p.t0 !== undefined ? p.t0 : p.t1;
+    var t1 = p.t2;
+    var t2 = p.t3;
+    var t3 = t4;
+    var serverProcessing = Math.max(0, t2 - t1);
+    var rtt = Math.max(0, (t3 - t0) - serverProcessing);
+    var rawOffset = ((t1 - t0) + (t2 - t3)) / 2;
+
+    // Outlier rejection (>500ms)
+    if (rtt > 500) return;
+
+    clockSamples.push({ rtt: rtt, offset: rawOffset });
+    if (clockSamples.length > 8) clockSamples.shift();
+
+    var best = clockSamples.reduce(function(min, s) { return s.rtt < min.rtt ? s : min; }, clockSamples[0]);
+    if (best) {
+      offset = clockSamples.length === 1 ? best.offset : (0.2 * best.offset + 0.8 * offset);
+      if (sock && sock.connected) {
+        sock.emit('heartbeat', { rtt: best.rtt, clockOffset: offset });
+      }
+    }
+  }
+
   function doConnect() {
-    sock = io('https://sync.kushalneedsmcp.online', {
+    var syncUrl = getSyncUrl();
+    sock = io(syncUrl, {
       path: '/',
       transports: ['websocket', 'polling']
     });
 
     var userId = 'ext-' + Math.random().toString(36).slice(2, 10);
+    clockSamples = [];
 
     sock.on('connect', function() {
       connected = true;
       sock.emit('room:join', { roomId: roomCode, userId: userId, name: userName });
-      sock.emit('clock:req', { t1: Date.now() });
+      sock.emit('clock:req', { t0: Date.now(), t1: Date.now() });
       updateStatus('● Synced — Room: ' + roomCode, '#10b981');
       if (video) video.style.outline = '3px solid #10b981';
     });
 
-    sock.on('clock:res', function(p) {
-      var t4 = Date.now();
-      var rtt = t4 - p.t1;
-      offset = (p.t3 + rtt / 2) - t4;
-    });
+    sock.on('clock:res', processClockResponse);
 
     sock.on('state:sync', function(s) {
-      if (!video || !s.videoUrl) return;
+      if (!video || (!s.videoUrl && s.videoType !== 'file')) return;
       guard = true;
+      var desiredRate = s.playbackRate || 1;
       var serverNow = Date.now() + offset;
       var elapsed = s.isPlaying ? (serverNow - s.lastChangedAt) / 1000 : 0;
-      var expected = s.currentTime + elapsed;
+      var expected = s.currentTime + elapsed * desiredRate;
       var delta = Math.abs(video.currentTime - expected);
 
-      if (delta > 1.5) {
+      // Deadband 0.1s, hard seek 1.0s, rate clamping [0.95, 1.05]
+      if (delta > 1.0) {
         video.currentTime = expected;
+        video.playbackRate = desiredRate;
       } else if (delta > 0.1) {
-        video.playbackRate = s.isPlaying ? 1.05 : 1;
+        if (video.currentTime < expected) {
+          video.playbackRate = Math.min(desiredRate * 1.05, 1.05);
+        } else {
+          video.playbackRate = Math.max(desiredRate * 0.95, 0.95);
+        }
       } else {
-        video.playbackRate = s.playbackRate || 1;
+        video.playbackRate = desiredRate;
       }
 
       if (s.isPlaying && video.paused) {
@@ -159,6 +204,20 @@
       }
 
       setTimeout(function() { guard = false; }, 200);
+    });
+
+    sock.on('REC:play', function() {
+      if (video && video.paused) video.play().catch(function() {});
+    });
+    sock.on('REC:pause', function() {
+      if (video && !video.paused) video.pause();
+    });
+    sock.on('REC:seek', function(p) {
+      if (video && typeof p?.time === 'number') {
+        video.currentTime = p.time;
+        if (p.playing && video.paused) video.play().catch(function() {});
+        else if (!p.playing && !video.paused) video.pause();
+      }
     });
 
     sock.on('chat:new', function(m) {
@@ -174,28 +233,57 @@
     video.addEventListener('pause', onPause);
     video.addEventListener('seeked', onSeek);
     video.addEventListener('ratechange', onRate);
+    video.addEventListener('waiting', onWaiting);
+    video.addEventListener('playing', onPlaying);
 
-    // Periodic clock sync
-    setInterval(function() {
-      if (sock && sock.connected) sock.emit('clock:req', { t1: Date.now() });
-    }, 30000);
+    // Periodic clock sync (every 5s)
+    if (clockInterval) clearInterval(clockInterval);
+    clockInterval = setInterval(function() {
+      if (sock && sock.connected) sock.emit('clock:req', { t0: Date.now(), t1: Date.now() });
+    }, 5000);
   }
 
-  function onPlay() { if (!guard && sock) sock.emit('state:intent', { isPlaying: true, currentTime: video.currentTime }); }
-  function onPause() { if (!guard && sock) sock.emit('state:intent', { isPlaying: false, currentTime: video.currentTime }); }
-  function onSeek() { if (!guard && sock) sock.emit('state:intent', { currentTime: video.currentTime }); }
-  function onRate() { if (!guard && sock) sock.emit('state:intent', { playbackRate: video.playbackRate }); }
+  function onPlay() {
+    if (!guard && sock) {
+      sock.emit('CMD:play', {});
+      sock.emit('state:intent', { isPlaying: true, currentTime: video.currentTime });
+    }
+  }
+  function onPause() {
+    if (!guard && sock) {
+      sock.emit('CMD:pause', {});
+      sock.emit('state:intent', { isPlaying: false, currentTime: video.currentTime });
+    }
+  }
+  function onSeek() {
+    if (!guard && sock) {
+      sock.emit('CMD:seek', { time: video.currentTime, playing: !video.paused });
+      sock.emit('state:intent', { currentTime: video.currentTime });
+    }
+  }
+  function onRate() {
+    if (!guard && sock) sock.emit('state:intent', { playbackRate: video.playbackRate });
+  }
+  function onWaiting() {
+    if (!guard && sock) sock.emit('buffer:event', { type: 'waiting', position: video.currentTime });
+  }
+  function onPlaying() {
+    if (!guard && sock) sock.emit('buffer:event', { type: 'playing', position: video.currentTime });
+  }
 
   function disconnectSync() {
+    if (clockInterval) { clearInterval(clockInterval); clockInterval = null; }
     if (sock) { sock.disconnect(); sock = null; }
     connected = false;
     updateStatus('Sync with WatchParty', '#7c3aed');
-    if (video) video.style.outline = '';
     if (video) {
+      video.style.outline = '';
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('seeked', onSeek);
       video.removeEventListener('ratechange', onRate);
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('playing', onPlaying);
     }
   }
 

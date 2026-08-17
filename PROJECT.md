@@ -1,48 +1,73 @@
-# Project: WatchParty
+# Project: WatchParty — Multi-Agent Debugging & Adversarial Verification
 
 ## Architecture
-WatchParty consists of:
-- Next.js Frontend & API routes (App Router, Tailwind CSS, Lucide icons, Video player components, WhatsApp-style Chat UI).
-- Authoritative State Sync Engine (Cristian's algorithm NTP sync, EMA offset estimation, PI slewing rate controller for YouTube/HLS/MP4).
-- Virtual Desktop (VM) Service (`vm-service` directory: Express / WebSocket / WebRTC streaming server with Dockerized headless browser / Chromium integration, cursor overlay, floor control).
-- Mini-services / Backend Services (`mini-services` directory for state sync or WebSocket hub if applicable).
-- Database & Persistence (Prisma ORM, SQLite / PostgreSQL schema for rooms, users, chat messages).
+WatchParty is a real-time collaborative watch party platform consisting of:
+1. **Sync Microservice (`mini-services/sync-service/index.ts`)**: Socket.IO server handling room state, sequence numbering, Cristian's clock sync timestamps, group buffer synchronization, command relays (`CMD:play/pause/seek/ts`), and WebRTC/VM signaling.
+2. **VM Microservice (`vm-service/`)**: WebSocket & HTTP server providing remote Chromium co-browsing via CDP/VNC screencasting, floor control mutex, cursor mapping, and URL security filtering.
+3. **Client Frontend (Next.js 16.3 / React 19 / Bun)**:
+   - Synchronized player stage supporting YouTube, HLS, native MP4/WebM, Local File Sync, VirtualBrowser, WebRTC StreamPlayer, TorrentPlayer, and CineVo extension bridge.
+   - SidePanel containing WhatsApp-styled Chat, Queue playlist, and Calls with privacy modes.
+   - Light theme as default styling.
 
 ## Feature Inventory
 | # | Feature | Description | Milestone | Source |
 |---|---------|-------------|-----------|--------|
-| 1 | NTP & Cristian's Math Spec | Architectural survey & formulas for \bar{\theta}, \delta, PI controller (0.95x-1.05x) | M1 | ORIGINAL_REQUEST §R1 |
-| 2 | VM Co-Browsing Spec | WebSocket/WebRTC streaming, unit vector cursor (x_{norm}, y_{norm}), floor control | M1 | ORIGINAL_REQUEST §R1 |
-| 3 | Render & Cloud Infra Spec | Container flags (--disable-dev-shm-usage, --js-flags="--max-old-space-size=512"), env vars | M1 | ORIGINAL_REQUEST §R1 |
-| 4 | State Sync Engine | Cristian's NTP, EMA offset, PI rate controller for YouTube, HLS, MP4 | M2 | ORIGINAL_REQUEST §R2 |
-| 5 | Frame-exact Join & Drift Slewing | Instant playhead sync on join, smooth 100ms-1000ms drift correction without audio pops | M2 | ORIGINAL_REQUEST §R2 |
-| 6 | VM Co-Browsing Stage | Interactive multi-user stage with cursor overlay, floor control queue, URL nav | M3 | ORIGINAL_REQUEST §R3 |
-| 7 | Widescreen UI & WhatsApp Chat | 16:9 widescreen protection, WhatsApp chat bubbles with avatars, system notifications | M4 | ORIGINAL_REQUEST §R4 |
-| 8 | Participant List & Camera Privacy | Room participants with crowns, opt-in camera privacy toggles | M4 | ORIGINAL_REQUEST §R4 |
-| 9 | Cloud Containerization & Build | Docker setup, Render.com config, PORT/CORS/PUBLIC_URL/DATABASE_URL env, 0 TS/ESLint errors build | M5 | ORIGINAL_REQUEST §R5 |
+| 1 | Clock Sync Estimator | Cristian's NTP algorithm with EMA smoothing (alpha=0.2), RTT outlier rejection (>500ms), sliding window (k=8) | M1 | Survey 1 |
+| 2 | PI Slewing Rate Controller | 3-tier playhead synchronization: deadband (<=100ms), PI rate slewing (0.95x-1.05x) with anti-windup, hard seek (>1.0s) | M1 | Survey 1 |
+| 3 | Command Relays & tsMap | `CMD:play/pause/seek/ts` relays, `tsMap` heartbeat broadcasting and inactive peer pruning | M1 | Survey 1 |
+| 4 | Buffer-Aware Group Wait | Group buffering pause/resume with dynamic RTT padding and disconnect deadlock prevention | M1 | Survey 1 |
+| 5 | WebRTC Mesh Signaling | Targeted peer-to-peer `rtc:signal` routing and `stream:announce` | M1 | Survey 1 |
+| 6 | CineVo & Local File Sync | MV3 isolated-world extension bridge and zero-upload local file playback state propagation | M1 | Survey 1 |
+| 7 | VM Floor Control Mutex | IDLE <-> OCCUPIED floor control state machine and disconnect queue promotion | M2 | Survey 2 |
+| 8 | VM Remote Cursor Mapping | Clamped normalized cursor coordinates in [0, 1]^2 space and viewport scaling | M2 | Survey 2 |
+| 9 | VM Security & Single-Writer | URL sanitization (RFC 3986, block private IP/file schemes), single-writer invariant on Opcode 11/16 | M2 | Survey 2 |
+| 10 | VM Real-Time Frame & Nav Push | Opcode 1 JPEG screencasting and Opcode 12 CDP frame navigation decoder | M2 | Survey 2 |
+| 11 | UniversalPlayer & Engines | YouTube, HLS, native video, local file sync integration with unified controller | M3 | Survey 3 |
+| 12 | VirtualBrowser & Auxiliary Players | VirtualBrowser, CineVoPanel, StreamPlayer, TorrentPlayer UI integrations | M3 | Survey 3 |
+| 13 | SidePanel & WhatsApp Chat | WhatsApp-styled ChatPanel, QueuePanel, CallsPanel with 3 privacy modes | M3 | Survey 3 |
+| 14 | Light Theme Default | Default Porcelain light theme via CSS :root and removal of hardcoded dark class on html | M3 | Survey 3 |
+| 15 | Adversarial & E2E Test Suite | Comprehensive multi-tier unit, integration, and adversarial tests (`bun test`) | M4 | Survey 1-3 |
+| 16 | Production Build & Git Cleanliness | Next.js production build (`bun run build`), clean tree, push to origin/main | M5 | Survey 3 |
 
 ## Milestones
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
-| M1 | Architectural Research & Specs | Comprehensive research & specifications for NTP math, VM streaming, Render cloud flags | None | DONE |
-| M2 | State Sync Engine | Cristian's NTP, EMA offset, PI rate controller across video providers | M1 | DONE |
-| M3 | VM Co-Browsing Stage | Multi-user VM co-browsing, cursor overlay, floor control, URL navigation | M1 | DONE |
-| M4 | Modern UI & WhatsApp Chat | 16:9 widescreen stage, WhatsApp chat, crowns, camera privacy | M2, M3 | DONE |
-| M5 | Cloud Deployment & Verification | Docker setup, env variables, zero-error production build | M1, M2, M3, M4 | DONE |
+| M1 | State Sync Engine Hardening | `mini-services/sync-service/`, `src/lib/sync/`, `src/lib/webrtc/`, `extension/` | none | IN_PROGRESS |
+| M2 | VM Co-Browsing Hardening | `vm-service/`, `src/components/watchparty/virtual-browser.tsx` | none | PLANNED |
+| M3 | UI Players & Light Theme Default | `src/app/layout.tsx`, `src/components/watchparty/` | M1, M2 | PLANNED |
+| M4 | Comprehensive & Adversarial Tests | `src/__tests__/`, `src/lib/sync/__tests__/` | M1, M2, M3 | PLANNED |
+| M5 | Production Build & Git Push | Production build, git commit & push to origin/main | M4 | PLANNED |
 
 ## Interface Contracts
-### Client ↔ Sync Server (WebSocket)
-- NTP probe: `{ type: 'ntp_ping', clientTime: number }` -> `{ type: 'ntp_pong', clientTime: number, serverTime: number }`
-- Room Sync State: `{ type: 'room_state', playhead: number, isPlaying: boolean, serverTime: number, mediaUrl: string, mediaType: 'youtube' | 'hls' | 'mp4' | 'vm' }`
+### Client Sync Hook ↔ Sync Service (`Socket.IO :3003`)
+- `clock:ping` -> `{ t0: number }`
+- `clock:pong` <- `{ t0: number, t1: number, t2: number }`
+- `CMD:play` / `CMD:pause` / `CMD:seek` / `CMD:ts` -> payload with `{ room, userId, time, seq, ... }`
+- `REC:play` / `REC:pause` / `REC:seek` / `REC:tsMap` <- broadcast to room members
+- `buffer:event` -> `{ room, userId, type: "waiting" | "playing", position }`
+- `rtc:signal` -> `{ room, to: string, msg: any }` -> relayed to specific peer `to`
 
-### Client ↔ VM Server (WebSocket/WebRTC)
-- Floor control: `{ type: 'floor_request' }`, `{ type: 'floor_release' }`, `{ type: 'floor_granted', userId: string }`
-- Input events: `{ type: 'cursor_move', xNorm: number, yNorm: number }`, `{ type: 'click', xNorm: number, yNorm: number }`, `{ type: 'navigate', url: string }`
+### Client VirtualBrowser ↔ VM Service (`WS :3004`)
+- Opcode 1 (0x01): JPEG frame payload `[0x01, ...jpeg_bytes]`
+- Opcode 2 (0x02): Mouse Move `[0x02, x_f32, y_f32]`
+- Opcode 3 (0x03): Mouse Down `[0x03, button_u8, x_f32, y_f32]`
+- Opcode 4 (0x04): Mouse Up `[0x04, button_u8, x_f32, y_f32]`
+- Opcode 5 (0x05): Key Down `[0x05, len_u8, ...key_utf8]`
+- Opcode 6 (0x06): Key Up `[0x06, len_u8, ...key_utf8]`
+- Opcode 7 (0x07): Scroll `[0x07, dx_f32, dy_f32]`
+- Opcode 8 (0x08): Navigate `[0x08, len_u16, ...url_utf8]`
+- Opcode 11 (0x0B): Text Input `[0x0B, len_u16, ...text_utf8]`
+- Opcode 12 (0x0C): CDP Frame Navigated Push `[0x0C, len_u16, ...url_utf8]`
+- Opcode 16 (0x10): Request Floor Control `[0x10, len_u8, ...userId_utf8]`
+- Opcode 17 (0x11): Release Floor Control `[0x11, len_u8, ...userId_utf8]`
+- Opcode 18 (0x12): Floor Status Broadcast `[0x12, state_u8, len_u8, ...controllerId_utf8]`
 
 ## Code Layout
-- `src/app`: Next.js pages & API routes
-- `src/components`: UI components (player, chat, vm, participant list)
-- `src/lib/sync`: State sync engine, Cristian's NTP, EMA, PI controller
-- `vm-service`: Express/WebSocket/WebRTC Virtual Desktop backend
-- `mini-services`: Helper services
-- `prisma`: Database schema & migrations
+- `mini-services/sync-service/`: Standalone Socket.IO sync server
+- `vm-service/`: Standalone VM co-browsing daemon
+- `src/lib/sync/`: Sync primitives (`clock-sync.ts`, `pi-controller.ts`, `use-sync-engine.ts`, `use-video-controller.ts`, `types.ts`)
+- `src/lib/webrtc/`: WebRTC streaming primitives (`use-webrtc-stream.ts`)
+- `src/components/watchparty/`: UI components (`universal-player.tsx`, `virtual-browser.tsx`, `stream-player.tsx`, `torrent-player.tsx`, `side-panel.tsx`, `chat-panel.tsx`, `queue-panel.tsx`, `calls-panel.tsx`)
+- `src/app/`: Next.js App Router (`layout.tsx`, `page.tsx`, `globals.css`)
+- `src/__tests__/`: Test suites
+- `extension/`: Chrome MV3 extension

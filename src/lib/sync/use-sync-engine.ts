@@ -8,6 +8,7 @@ import {
   ChatMessage,
   Reaction,
 } from "./types";
+import { ClockSyncEstimator } from "./clock-sync";
 
 interface Socket {
   on(event: string, fn: (arg: any) => void): Socket;
@@ -142,11 +143,13 @@ export function useSyncEngine({
   }>({ play: null, pause: null, seek: null });
   const [streamHost, setStreamHost] = useState<{ userId: string; fileName: string } | null>(null);
 
-  const clockSamplesRef = useRef<Array<{ t0: number; t1: number; serverTime: number }>>([]);
+  const clockEstimatorRef = useRef<ClockSyncEstimator>(
+    new ClockSyncEstimator({ windowSize: 8, maxRttThresholdMs: 500, alpha: 0.2 }),
+  );
 
   const runClockSync = useCallback((sock: Socket) => {
-    const t0 = performance.now();
-    sock.emit("clock:req", { t1: Date.now(), t0 });
+    const t0 = Date.now();
+    sock.emit("clock:req", { t0, t1: t0 });
   }, []);
 
   useEffect(() => {
@@ -186,6 +189,7 @@ export function useSyncEngine({
 
       sock.on("connect", () => {
         setStats((s) => ({ ...s, connected: true }));
+        clockEstimatorRef.current.reset();
         sock!.emit("room:join", { roomId, userId, name: userName });
         runClockSync(sock!);
       });
@@ -198,25 +202,20 @@ export function useSyncEngine({
         setStats((s) => ({ ...s, connected: false }));
       });
 
-      sock.on("clock:res", (p: { t1: number; t2: number; t3: number }) => {
-        const t4 = Date.now();
-        const rtt = t4 - p.t1;
-        clockSamplesRef.current.push({ t0: p.t1, t1: t4, serverTime: p.t3 });
-        if (clockSamplesRef.current.length > 8) clockSamplesRef.current.shift();
-
-        const sorted = clockSamplesRef.current.slice().sort(
-          (a, b) => (a.t1 - a.t0) - (b.t1 - b.t0),
-        );
-        const best = sorted[0];
-        if (best) {
-          const bestRtt = best.t1 - best.t0;
-          const bestOffset = best.serverTime + bestRtt / 2 - best.t1;
+      sock.on("clock:res", (p: { t0?: number; t1: number; t2: number; t3: number }) => {
+        const t0 = p.t0 ?? p.t1;
+        const t1 = p.t2;
+        const t2 = p.t3;
+        const t3 = Date.now();
+        const res = clockEstimatorRef.current.processProbe(t0, t1, t2, t3);
+        if (res.accepted) {
           setStats((s) => ({
             ...s,
-            clockOffset: bestOffset,
-            rtt: bestRtt,
-            lastDriftMs: Math.abs(bestOffset),
+            clockOffset: res.offset,
+            rtt: res.rtt,
+            lastDriftMs: Math.abs(res.offset),
           }));
+          sock?.emit("heartbeat", { rtt: res.rtt, clockOffset: res.offset });
         }
       });
 

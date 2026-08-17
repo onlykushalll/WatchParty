@@ -26,6 +26,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
+import { FloorControlManager, normalizeCoordinates, sanitizeUrl } from "./index";
 
 const PORT = 3004;
 const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
@@ -40,8 +41,48 @@ let browser: Browser | null = null;
 let page: Page | null = null;
 let cdpSession: any = null;
 const clients = new Set<WebSocket>();
+const floorManager = new FloorControlManager();
 let lastFrame: Buffer | null = null;
 let screencasting = false;
+
+function broadcastControlState() {
+  const state = floorManager.getControlState();
+  const msg = Buffer.concat([
+    Buffer.from([129]),
+    Buffer.from(JSON.stringify(state)),
+  ]);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+function broadcastGrantControl(controllerId: string | null, controllerName?: string | null) {
+  const msg = Buffer.concat([
+    Buffer.from([128]),
+    Buffer.from(JSON.stringify({ controllerId, controllerName })),
+  ]);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+function broadcastUrl(currentUrl: string) {
+  const urlBuf = Buffer.from(currentUrl, "utf-8");
+  const len = urlBuf.length;
+  const msg = Buffer.concat([
+    Buffer.from([12, (len >> 8) & 0xff, len & 0xff]),
+    urlBuf,
+  ]);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
 
 // ─── Browser launch ───
 async function launchBrowser() {
@@ -85,6 +126,13 @@ async function launchBrowser() {
 
   page = (await browser.pages())[0] || (await browser.newPage());
   await page.setViewport({ width: WIDTH, height: HEIGHT });
+
+  // CDP frame navigation push listener
+  page.on("framenavigated", (frame) => {
+    if (page && frame === page.mainFrame()) {
+      broadcastUrl(page.url());
+    }
+  });
 
   // Anti-detection
   await page.evaluateOnNewDocument(() => {
@@ -155,16 +203,17 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       try {
         const { url: navUrl } = JSON.parse(body);
         if (navUrl && page) {
-          await page.goto(navUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+          const validUrl = sanitizeUrl(navUrl);
+          await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, url: page.url() }));
         } else {
           res.writeHead(400);
-          res.end(JSON.stringify({ ok: false }));
+          res.end(JSON.stringify({ ok: false, error: "Missing url" }));
         }
       } catch (e) {
-        res.writeHead(500);
-        res.end(JSON.stringify({ ok: false }));
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: String((e as Error).message || e) }));
       }
     });
     return;
@@ -191,40 +240,131 @@ wss.on("connection", (ws: WebSocket) => {
     ws.send(Buffer.concat([Buffer.from([1]), lastFrame]));
   }
 
+  // Send current floor state upon connection
+  const currentState = floorManager.getControlState();
+  ws.send(Buffer.concat([Buffer.from([129]), Buffer.from(JSON.stringify(currentState))]));
+
   ws.on("message", async (data: Buffer) => {
     if (!page || !cdpSession) return;
     try {
       const type = data[0];
-      const payload = JSON.parse(data.slice(1).toString("utf-8"));
+      const payloadStr = data.length > 1 ? data.slice(1).toString("utf-8") : "";
+      let payload: any = {};
+      if (payloadStr) {
+        try {
+          payload = JSON.parse(payloadStr);
+        } catch (e) {}
+      }
+
+      // Floor Control Messages
+      if (type === 16) {
+        // request-control
+        let { userId, userName } = payload;
+        if (!userId && data.length >= 2) {
+          const len = data[1];
+          if (data.length >= 2 + len) {
+            userId = data.slice(2, 2 + len).toString("utf-8");
+            userName = userId;
+          }
+        }
+        if (!userId) userId = "user_" + Math.random().toString(36).slice(2, 8);
+        const res = floorManager.requestControl(userId, userName || "User", ws);
+        if (res.status === "granted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: userId, controllerName: userName })),
+          ]);
+          ws.send(grantMsg);
+        }
+        broadcastControlState();
+        return;
+      } else if (type === 17) {
+        // release-control
+        let { userId } = payload;
+        if (!userId && data.length >= 2) {
+          const len = data[1];
+          if (data.length >= 2 + len) {
+            userId = data.slice(2, 2 + len).toString("utf-8");
+          }
+        }
+        if (!userId) userId = floorManager.getActiveControllerId() || "";
+        const res = floorManager.releaseControl(userId, ws);
+        if (res.status === "unauthorized") {
+          return;
+        }
+        if (res.status === "promoted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+          ]);
+          if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+            res.nextSocket.send(grantMsg);
+          }
+        } else if (res.status === "idle") {
+          broadcastGrantControl(null);
+        }
+        broadcastControlState();
+        return;
+      } else if (type === 18) {
+        // revoke-control
+        const { targetUserId } = payload;
+        const res = floorManager.revokeControl(targetUserId);
+        if (res.status === "promoted") {
+          const grantMsg = Buffer.concat([
+            Buffer.from([128]),
+            Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+          ]);
+          if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+            res.nextSocket.send(grantMsg);
+          }
+        } else if (res.status === "idle") {
+          broadcastGrantControl(null);
+        }
+        broadcastControlState();
+        return;
+      }
+
+      // Single-Writer Security Invariant: reject input events if not current active controller
+      if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(type)) {
+        if (!floorManager.isController(ws)) {
+          return;
+        }
+      }
 
       if (type === 2) {
         // Mouse move — normalized coordinates → absolute
-        const x = Math.round(payload.x * WIDTH);
-        const y = Math.round(payload.y * HEIGHT);
-        await cdpSession.send("Input.dispatchMouseEvent", {
-          type: "mouseMoved",
-          x,
-          y,
-        });
+        const xNorm = payload.xNorm !== undefined ? payload.xNorm : payload.x;
+        const yNorm = payload.yNorm !== undefined ? payload.yNorm : payload.y;
+        if (xNorm !== undefined && yNorm !== undefined) {
+          const { x, y } = normalizeCoordinates(xNorm, yNorm, WIDTH, HEIGHT);
+          await cdpSession.send("Input.dispatchMouseEvent", {
+            type: "mouseMoved",
+            x,
+            y,
+          });
+        }
       } else if (type === 3) {
         // Mouse click
-        const x = Math.round(payload.x * WIDTH);
-        const y = Math.round(payload.y * HEIGHT);
-        const button = payload.button === "right" ? "right" : "left";
-        await cdpSession.send("Input.dispatchMouseEvent", {
-          type: "mousePressed",
-          x,
-          y,
-          button,
-          clickCount: 1,
-        });
-        await cdpSession.send("Input.dispatchMouseEvent", {
-          type: "mouseReleased",
-          x,
-          y,
-          button,
-          clickCount: 1,
-        });
+        const xNorm = payload.xNorm !== undefined ? payload.xNorm : payload.x;
+        const yNorm = payload.yNorm !== undefined ? payload.yNorm : payload.y;
+        if (xNorm !== undefined && yNorm !== undefined) {
+          const { x, y } = normalizeCoordinates(xNorm, yNorm, WIDTH, HEIGHT);
+          const button = payload.button === "right" ? "right" : "left";
+          await cdpSession.send("Input.dispatchMouseEvent", {
+            type: "mousePressed",
+            x,
+            y,
+            button,
+            clickCount: 1,
+          });
+          await cdpSession.send("Input.dispatchMouseEvent", {
+            type: "mouseReleased",
+            x,
+            y,
+            button,
+            clickCount: 1,
+          });
+        }
       } else if (type === 4) {
         // Scroll
         await cdpSession.send("Input.dispatchMouseEvent", {
@@ -248,24 +388,29 @@ wss.on("connection", (ws: WebSocket) => {
           " ": "Space",
         };
         const key = keyMap[payload.key] || payload.key;
-        await cdpSession.send("Input.dispatchKeyEvent", {
-          type: "keyDown",
-          key: payload.key,
-          code: key,
-        });
-        await cdpSession.send("Input.dispatchKeyEvent", {
-          type: "keyUp",
-          key: payload.key,
-          code: key,
-        });
+        if (payload.key) {
+          await cdpSession.send("Input.dispatchKeyEvent", {
+            type: "keyDown",
+            key: payload.key,
+            code: key,
+          });
+          await cdpSession.send("Input.dispatchKeyEvent", {
+            type: "keyUp",
+            key: payload.key,
+            code: key,
+          });
+        }
       } else if (type === 6) {
-        // Type text (single characters) — use page.evaluate for reliability
-        // CDP's char event doesn't work on all sites, but direct DOM manipulation does
-        const script = `(function(){var el=document.activeElement;if(el&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable)){if(el.isContentEditable){document.execCommand('insertText',false,${JSON.stringify(payload.text)})}else{el.value+=(${JSON.stringify(payload.text)});el.dispatchEvent(new Event('input',{bubbles:true}))}}})()`;
-        await page.evaluate(script).catch(() => {});
+        // Type text (single characters) — safe text typing
+        if (payload.text) {
+          await page.keyboard.type(payload.text);
+        }
       } else if (type === 7) {
         // Navigate
-        await page.goto(payload.url, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+        if (payload.url) {
+          const validUrl = sanitizeUrl(payload.url);
+          await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+        }
       } else if (type === 8) {
         await page.goBack().catch(() => {});
       } else if (type === 9) {
@@ -273,8 +418,10 @@ wss.on("connection", (ws: WebSocket) => {
       } else if (type === 10) {
         await page.reload().catch(() => {});
       } else if (type === 11) {
-        // Evaluate JS
-        await page.evaluate(payload.script).catch(() => {});
+        // Safe input handling / evaluate removal for untrusted script execution
+        if (payload.text) {
+          await page.keyboard.type(payload.text);
+        }
       }
     } catch (e) {
       // Ignore input errors (page might be navigating)
@@ -284,6 +431,19 @@ wss.on("connection", (ws: WebSocket) => {
   ws.on("close", () => {
     clients.delete(ws);
     console.log(`[vm] WS client disconnected (${clients.size} total)`);
+    const res = floorManager.handleDisconnect(ws);
+    if (res?.status === "promoted") {
+      const grantMsg = Buffer.concat([
+        Buffer.from([128]),
+        Buffer.from(JSON.stringify({ controllerId: res.nextControllerId, controllerName: res.nextControllerName })),
+      ]);
+      if (res.nextSocket && res.nextSocket.readyState === WebSocket.OPEN) {
+        res.nextSocket.send(grantMsg);
+      }
+    } else if (res?.status === "idle") {
+      broadcastGrantControl(null);
+    }
+    broadcastControlState();
   });
 });
 

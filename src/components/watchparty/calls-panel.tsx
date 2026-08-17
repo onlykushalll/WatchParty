@@ -15,10 +15,11 @@ import {
   EyeOff,
   Sparkles,
   ShieldAlert,
+  Radio,
 } from "lucide-react";
 import { toast } from "sonner";
 
-interface CallsPanelProps {
+export interface CallsPanelProps {
   participants: Participant[];
   youId: string;
   youName: string;
@@ -31,6 +32,8 @@ interface CallsPanelProps {
   }>) => void;
 }
 
+export type CallPrivacyMode = "standard" | "avatar" | "blur" | "blackout";
+
 export function CallsPanel({
   participants,
   youId,
@@ -42,10 +45,18 @@ export function CallsPanel({
   const [optedIn, setOptedIn] = useState(false);
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(true);
-  const [privacyMode, setPrivacyMode] = useState<"blackout" | "blur" | "avatar">("avatar");
+  const [privacyMode, setPrivacyMode] = useState<CallPrivacyMode>("avatar");
+  const [pushToTalk, setPushToTalk] = useState(false);
+  const [isPttActive, setIsPttActive] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const isPttActiveRef = useRef(isPttActive);
+  isPttActiveRef.current = isPttActive;
+  const pushToTalkRef = useRef(pushToTalk);
+  pushToTalkRef.current = pushToTalk;
+  const isMicMutedRef = useRef(isMicMuted);
+  isMicMutedRef.current = isMicMuted;
 
   // Stop media tracks when component unmounts or opt-out
   const stopTracks = useCallback(() => {
@@ -69,7 +80,7 @@ export function CallsPanel({
       onUpdateMediaState({
         isMicMuted: false,
         isCameraOn: true,
-        cameraPrivacyMode: privacyMode,
+        cameraPrivacyMode: privacyMode === "standard" ? "avatar" : privacyMode,
       });
       toast.success("Webcam & Mic activated (Opt-In)");
     } catch (err) {
@@ -81,7 +92,7 @@ export function CallsPanel({
       onUpdateMediaState({
         isMicMuted: true,
         isCameraOn: false,
-        cameraPrivacyMode: privacyMode,
+        cameraPrivacyMode: privacyMode === "standard" ? "avatar" : privacyMode,
       });
       toast.info("Webcam active in Privacy Avatar mode");
     }
@@ -95,7 +106,7 @@ export function CallsPanel({
     onUpdateMediaState({
       isMicMuted: true,
       isCameraOn: false,
-      cameraPrivacyMode: privacyMode,
+      cameraPrivacyMode: privacyMode === "standard" ? "avatar" : privacyMode,
     });
     toast.info("Left video call");
   };
@@ -109,6 +120,10 @@ export function CallsPanel({
 
   // Toggle mic track
   const toggleMic = () => {
+    if (pushToTalk) {
+      toast.info("Push-to-Talk is active. Hold Space to speak.");
+      return;
+    }
     const nextMuted = !isMicMuted;
     setIsMicMuted(nextMuted);
     if (stream) {
@@ -133,11 +148,75 @@ export function CallsPanel({
     toast.info(nextCam ? "Camera turned on" : "Camera turned off");
   };
 
-  // Change privacy mode
-  const changePrivacyMode = (mode: "blackout" | "blur" | "avatar") => {
+  // Change privacy mode (standard, avatar, blur, blackout)
+  const changePrivacyMode = (mode: CallPrivacyMode) => {
     setPrivacyMode(mode);
-    onUpdateMediaState({ cameraPrivacyMode: mode });
+    const backendMode = mode === "standard" ? "avatar" : mode;
+    onUpdateMediaState({ cameraPrivacyMode: backendMode });
     toast.info(`Privacy mode set to ${mode.toUpperCase()}`);
+  };
+
+  // Push-to-Talk spacebar event handler
+  useEffect(() => {
+    if (!optedIn || !pushToTalk) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === "Space" && !e.repeat && !isPttActiveRef.current) {
+        const target = e.target as HTMLElement;
+        if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
+        e.preventDefault();
+        setIsPttActive(true);
+        if (stream) {
+          stream.getAudioTracks().forEach((t) => (t.enabled = true));
+        }
+        setIsMicMuted(false);
+        onUpdateMediaState({ isMicMuted: false });
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === "Space" && isPttActiveRef.current) {
+        const target = e.target as HTMLElement;
+        if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") return;
+        e.preventDefault();
+        setIsPttActive(false);
+        if (stream) {
+          stream.getAudioTracks().forEach((t) => (t.enabled = false));
+        }
+        setIsMicMuted(true);
+        onUpdateMediaState({ isMicMuted: true });
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [optedIn, pushToTalk, stream, onUpdateMediaState]);
+
+  // Toggle Push to Talk mode
+  const togglePushToTalk = () => {
+    const nextPtt = !pushToTalk;
+    setPushToTalk(nextPtt);
+    if (nextPtt) {
+      // Mute by default until space is pressed
+      setIsMicMuted(true);
+      if (stream) {
+        stream.getAudioTracks().forEach((t) => (t.enabled = false));
+      }
+      onUpdateMediaState({ isMicMuted: true });
+      toast.info("Push-to-Talk ENABLED (Hold Space or PTT button to speak)");
+    } else {
+      setIsPttActive(false);
+      setIsMicMuted(false);
+      if (stream) {
+        stream.getAudioTracks().forEach((t) => (t.enabled = true));
+      }
+      onUpdateMediaState({ isMicMuted: false });
+      toast.info("Push-to-Talk DISABLED (Open Mic)");
+    }
   };
 
   // Cleanup tracks on unmount
@@ -171,25 +250,39 @@ export function CallsPanel({
   }
 
   return (
-    <div className="flex h-full flex-col gap-3 p-2 bg-background">
-      {/* Header controls & Privacy Selector */}
-      <div className="flex items-center justify-between gap-2 border-b pb-2">
-        <div className="flex items-center gap-1.5">
-          <Badge variant="outline" className="gap-1 border-emerald-500/40 text-emerald-400 text-[10px]">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-ping" />
-            Live Call
-          </Badge>
+    <div className="flex h-full flex-col gap-2 p-2 bg-background text-foreground">
+      {/* Header controls & Privacy Mode Selector */}
+      <div className="flex flex-col gap-1.5 border-b pb-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5">
+            <Badge variant="outline" className="gap-1 border-emerald-500/40 text-emerald-500 text-[10px]">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-ping" />
+              Live Call
+            </Badge>
+          </div>
+
+          {/* Push-to-Talk Toggle */}
+          <button
+            onClick={togglePushToTalk}
+            className={`rounded px-2 py-0.5 text-[10px] font-semibold border transition-all ${
+              pushToTalk
+                ? "bg-amber-500/15 border-amber-500/40 text-amber-500"
+                : "border-muted-foreground/20 text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {pushToTalk ? "PTT: ON" : "PTT: OFF"}
+          </button>
         </div>
 
-        {/* Privacy Mode Selector */}
+        {/* Privacy Mode Selector Chips */}
         <div className="flex rounded-md border bg-muted/50 p-0.5 text-[10px]">
-          {(["avatar", "blur", "blackout"] as const).map((m) => (
+          {(["standard", "avatar", "blur", "blackout"] as const).map((m) => (
             <button
               key={m}
               onClick={() => changePrivacyMode(m)}
-              className={`rounded px-2 py-0.5 font-medium transition-all ${
+              className={`flex-1 rounded py-0.5 font-medium text-center transition-all ${
                 privacyMode === m
-                  ? "bg-violet-600 text-white shadow-sm"
+                  ? "bg-violet-600 text-white shadow-xs"
                   : "text-muted-foreground hover:text-foreground"
               }`}
             >
@@ -206,25 +299,27 @@ export function CallsPanel({
           const isFloorController = vmController ? p.userId === vmController : false;
           const participantCamOn = isYou ? isCameraOn : (p.isCameraOn ?? false);
           const participantMicMuted = isYou ? isMicMuted : (p.isMicMuted ?? true);
-          const pPrivacyMode = isYou ? privacyMode : (p.cameraPrivacyMode || "avatar");
+          const pPrivacyMode = isYou
+            ? privacyMode
+            : (p.cameraPrivacyMode || "avatar");
 
           return (
             <div
               key={p.userId}
               className="relative aspect-video overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-md group"
             >
-              {/* Actual Video Stream for Local User if camera is ON */}
-              {isYou && stream && participantCamOn ? (
+              {/* Actual Video Stream for Local User if camera is ON and standard/blur */}
+              {isYou && stream && participantCamOn && (pPrivacyMode === "standard" || pPrivacyMode === "blur") ? (
                 <video
                   ref={localVideoRef}
                   autoPlay
                   playsInline
                   muted
                   className={`h-full w-full object-cover ${
-                    pPrivacyMode === "blur" ? "filter blur-md" : ""
+                    pPrivacyMode === "blur" ? "filter blur-md scale-105" : ""
                   }`}
                 />
-              ) : participantCamOn ? (
+              ) : participantCamOn && (pPrivacyMode === "standard" || pPrivacyMode === "blur") ? (
                 /* Remote active camera placeholder */
                 <div className="flex h-full w-full items-center justify-center bg-zinc-900 text-zinc-400 text-xs font-medium">
                   <Video className="mr-1.5 h-4 w-4 text-emerald-400" /> Remote Video Active
@@ -235,7 +330,7 @@ export function CallsPanel({
                   {pPrivacyMode === "blackout" && (
                     <div className="flex flex-col items-center justify-center gap-1 text-zinc-600">
                       <EyeOff className="h-6 w-6" />
-                      <span className="text-[10px]">Camera Blackout</span>
+                      <span className="text-[10px] font-medium">Camera Blackout</span>
                     </div>
                   )}
 
@@ -253,7 +348,7 @@ export function CallsPanel({
                     </div>
                   )}
 
-                  {pPrivacyMode === "avatar" && (
+                  {(pPrivacyMode === "avatar" || pPrivacyMode === "standard") && (
                     <div className="flex flex-col items-center justify-center gap-2">
                       <div
                         className="relative flex h-14 w-14 items-center justify-center rounded-full text-lg font-bold text-white shadow-lg"
@@ -315,37 +410,95 @@ export function CallsPanel({
         })}
       </div>
 
-      {/* Call Action Bar */}
-      <div className="flex items-center justify-center gap-2 border-t pt-2">
-        <Button
-          size="icon"
-          variant={isMicMuted ? "destructive" : "secondary"}
-          className="h-9 w-9 rounded-full"
-          onClick={toggleMic}
-          title={isMicMuted ? "Unmute Mic" : "Mute Mic"}
-        >
-          {isMicMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-        </Button>
+      {/* Push-to-Talk active button or Call Action Bar */}
+      {pushToTalk ? (
+        <div className="flex flex-col gap-1.5 border-t pt-2">
+          <Button
+            className={`w-full py-3 text-xs font-bold transition-all shadow-md ${
+              isPttActive
+                ? "bg-emerald-600 hover:bg-emerald-700 text-white animate-pulse"
+                : "bg-amber-600 hover:bg-amber-700 text-white"
+            }`}
+            onMouseDown={() => {
+              setIsPttActive(true);
+              if (stream) stream.getAudioTracks().forEach((t) => (t.enabled = true));
+              setIsMicMuted(false);
+              onUpdateMediaState({ isMicMuted: false });
+            }}
+            onMouseUp={() => {
+              setIsPttActive(false);
+              if (stream) stream.getAudioTracks().forEach((t) => (t.enabled = false));
+              setIsMicMuted(true);
+              onUpdateMediaState({ isMicMuted: true });
+            }}
+            onTouchStart={() => {
+              setIsPttActive(true);
+              if (stream) stream.getAudioTracks().forEach((t) => (t.enabled = true));
+              setIsMicMuted(false);
+              onUpdateMediaState({ isMicMuted: false });
+            }}
+            onTouchEnd={() => {
+              setIsPttActive(false);
+              if (stream) stream.getAudioTracks().forEach((t) => (t.enabled = false));
+              setIsMicMuted(true);
+              onUpdateMediaState({ isMicMuted: true });
+            }}
+          >
+            <Radio className="mr-1.5 h-4 w-4" />
+            {isPttActive ? "TRANSMITTING (Release to Mute)" : "HOLD TO TALK (or Space)"}
+          </Button>
+          <div className="flex justify-between items-center px-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="text-xs h-7"
+              onClick={toggleCamera}
+            >
+              {isCameraOn ? <Video className="h-3 w-3 mr-1" /> : <VideoOff className="h-3 w-3 mr-1" />}
+              {isCameraOn ? "Camera On" : "Camera Off"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 border-rose-500/30 text-rose-400 hover:bg-rose-500/10 text-xs"
+              onClick={stopCall}
+            >
+              Leave Call
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center justify-center gap-2 border-t pt-2">
+          <Button
+            size="icon"
+            variant={isMicMuted ? "destructive" : "secondary"}
+            className="h-9 w-9 rounded-full"
+            onClick={toggleMic}
+            title={isMicMuted ? "Unmute Mic" : "Mute Mic"}
+          >
+            {isMicMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+          </Button>
 
-        <Button
-          size="icon"
-          variant={!isCameraOn ? "destructive" : "secondary"}
-          className="h-9 w-9 rounded-full"
-          onClick={toggleCamera}
-          title={isCameraOn ? "Turn Off Camera" : "Turn On Camera"}
-        >
-          {!isCameraOn ? <VideoOff className="h-4 w-4" /> : <Video className="h-4 w-4" />}
-        </Button>
+          <Button
+            size="icon"
+            variant={!isCameraOn ? "destructive" : "secondary"}
+            className="h-9 w-9 rounded-full"
+            onClick={toggleCamera}
+            title={isCameraOn ? "Turn Off Camera" : "Turn On Camera"}
+          >
+            {!isCameraOn ? <VideoOff className="h-4 w-4" /> : <Video className="h-4 w-4" />}
+          </Button>
 
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-9 border-rose-500/30 text-rose-400 hover:bg-rose-500/10 text-xs px-3"
-          onClick={stopCall}
-        >
-          Leave Call
-        </Button>
-      </div>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-9 border-rose-500/30 text-rose-400 hover:bg-rose-500/10 text-xs px-3"
+            onClick={stopCall}
+          >
+            Leave Call
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

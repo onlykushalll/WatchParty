@@ -165,9 +165,10 @@ export function useWebRTCStream({
   useEffect(() => {
     if (!socket) return;
 
-    const handleSignal = async (data: { from: string; msg: any }) => {
-      const { from, msg } = data;
+    const handleSignal = async (data: { from: string; to?: string; msg: any }) => {
+      const { from, to, msg } = data;
       if (!msg) return;
+      if (to && to !== userId) return;
       let pc = peersRef.current.get(from);
 
       if (msg.sdp) {

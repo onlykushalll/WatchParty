@@ -104,8 +104,12 @@ export class FloorControlManager {
       if (requestingSocket && this.activeControllerSocket !== requestingSocket) {
         return { status: "unauthorized" };
       }
-      if (this.controlQueue.length > 0) {
+      while (this.controlQueue.length > 0) {
         const next = this.controlQueue.shift()!;
+        if (next.socket && (next.socket.readyState === 2 || next.socket.readyState === 3)) {
+          // Skip closed or closing sockets
+          continue;
+        }
         this.activeControllerId = next.userId;
         this.activeControllerName = next.userName;
         this.activeControllerSocket = next.socket;
@@ -115,13 +119,12 @@ export class FloorControlManager {
           nextControllerName: next.userName,
           nextSocket: next.socket,
         };
-      } else {
-        this.state = "IDLE";
-        this.activeControllerId = null;
-        this.activeControllerName = null;
-        this.activeControllerSocket = null;
-        return { status: "idle" };
       }
+      this.state = "IDLE";
+      this.activeControllerId = null;
+      this.activeControllerName = null;
+      this.activeControllerSocket = null;
+      return { status: "idle" };
     } else {
       const queuedItem = this.controlQueue.find((q) => q.userId === userId);
       if (queuedItem) {
@@ -237,9 +240,12 @@ function broadcastGrantControl(controllerId: string | null, controllerName?: str
 }
 
 function broadcastUrl(currentUrl: string) {
+  const urlBuf = Buffer.from(currentUrl, "utf-8");
+  const len = urlBuf.length;
+  // Binary framing: [12, len_hi, len_lo, ...url]
   const msg = Buffer.concat([
-    Buffer.from([12]), // Type 12 (0x0C): Push URL change
-    Buffer.from(JSON.stringify({ url: currentUrl })),
+    Buffer.from([12, (len >> 8) & 0xff, len & 0xff]),
+    urlBuf,
   ]);
   for (const ws of clients) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -417,7 +423,15 @@ wss.on("connection", (ws: WebSocket) => {
       // Floor Control Messages
       if (type === 16) {
         // request-control
-        const { userId, userName } = payload;
+        let { userId, userName } = payload;
+        if (!userId && data.length >= 2) {
+          const len = data[1];
+          if (data.length >= 2 + len) {
+            userId = data.slice(2, 2 + len).toString("utf-8");
+            userName = userId;
+          }
+        }
+        if (!userId) userId = "user_" + Math.random().toString(36).slice(2, 8);
         const res = floorManager.requestControl(userId, userName || "User", ws);
         if (res.status === "granted") {
           const grantMsg = Buffer.concat([
@@ -430,7 +444,14 @@ wss.on("connection", (ws: WebSocket) => {
         return;
       } else if (type === 17) {
         // release-control
-        const { userId } = payload;
+        let { userId } = payload;
+        if (!userId && data.length >= 2) {
+          const len = data[1];
+          if (data.length >= 2 + len) {
+            userId = data.slice(2, 2 + len).toString("utf-8");
+          }
+        }
+        if (!userId) userId = floorManager.getActiveControllerId() || "";
         const res = floorManager.releaseControl(userId, ws);
         if (res.status === "unauthorized") {
           return;
@@ -498,16 +519,18 @@ wss.on("connection", (ws: WebSocket) => {
       } else if (type === 5) {
         // Keyboard keydown
         const { key } = payload;
-        await page.keyboard.press(key);
+        if (key) await page.keyboard.press(key);
       } else if (type === 6) {
         // Type text
         const { text } = payload;
-        await page.keyboard.type(text);
+        if (text) await page.keyboard.type(text);
       } else if (type === 7) {
         // Navigate
         const { url } = payload;
-        const validUrl = sanitizeUrl(url);
-        await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        if (url) {
+          const validUrl = sanitizeUrl(url);
+          await page.goto(validUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        }
       } else if (type === 8) {
         await page.goBack();
       } else if (type === 9) {
@@ -515,8 +538,10 @@ wss.on("connection", (ws: WebSocket) => {
       } else if (type === 10) {
         await page.reload();
       } else if (type === 11) {
-        const { script } = payload;
-        await page.evaluate(script).catch(() => {});
+        // Safe input handling / evaluate removal for untrusted script execution
+        if (payload.text) {
+          await page.keyboard.type(payload.text);
+        }
       }
     } catch (e) {
       // Ignore input errors

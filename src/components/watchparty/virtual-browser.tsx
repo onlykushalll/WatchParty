@@ -61,6 +61,58 @@ export function VirtualBrowser({
   const isControllerRef = useRef(isController);
   isControllerRef.current = isController;
 
+  // Helper to send WS messages
+  const sendMsg = (type: number, payload: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const encoded = new TextEncoder().encode(JSON.stringify(payload));
+      const msg = new Uint8Array(1 + encoded.length);
+      msg[0] = type;
+      msg.set(encoded, 1);
+      wsRef.current.send(msg);
+    }
+  };
+
+  const requestFloorControl = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const userBytes = new TextEncoder().encode(userId || "");
+      const msg = new Uint8Array(2 + userBytes.length);
+      msg[0] = 0x10; // Opcode 16: request-control [0x10, len, ...userId]
+      msg[1] = userBytes.length & 0xff;
+      msg.set(userBytes, 2);
+      wsRef.current.send(msg);
+      // Also send JSON format for backward compatibility
+      sendMsg(16, { userId, userName });
+    }
+    onRequestControl();
+  };
+
+  const releaseFloorControl = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const userBytes = new TextEncoder().encode(userId || "");
+      const msg = new Uint8Array(2 + userBytes.length);
+      msg[0] = 0x11; // Opcode 17: release-control [0x11, len, ...userId]
+      msg[1] = userBytes.length & 0xff;
+      msg.set(userBytes, 2);
+      wsRef.current.send(msg);
+      // Also send JSON format for backward compatibility
+      sendMsg(17, { userId });
+    }
+    onReleaseControl();
+  };
+
+  // Sync floor control to vm-service whenever user gains control
+  useEffect(() => {
+    if (isController && wsRef.current?.readyState === WebSocket.OPEN) {
+      const userBytes = new TextEncoder().encode(userId || "");
+      const msg = new Uint8Array(2 + userBytes.length);
+      msg[0] = 0x10; // Opcode 16
+      msg[1] = userBytes.length & 0xff;
+      msg.set(userBytes, 2);
+      wsRef.current.send(msg);
+      sendMsg(16, { userId, userName });
+    }
+  }, [isController, userId, userName]);
+
   // WebSocket connection
   useEffect(() => {
     let cancelled = false;
@@ -75,7 +127,17 @@ export function VirtualBrowser({
     wsRef.current = ws;
 
     ws.onopen = () => {
-      if (!cancelled) setLoading(false);
+      if (!cancelled) {
+        setLoading(false);
+        if (isControllerRef.current) {
+          const userBytes = new TextEncoder().encode(userId || "");
+          const msg = new Uint8Array(2 + userBytes.length);
+          msg[0] = 0x10; // Opcode 16
+          msg[1] = userBytes.length & 0xff;
+          msg.set(userBytes, 2);
+          ws.send(msg);
+        }
+      }
     };
 
     ws.onmessage = (e) => {
@@ -106,6 +168,61 @@ export function VirtualBrowser({
           }
         };
         img.src = url;
+      } else if (data[0] === 12) {
+        // Opcode 12 (0x0C): CDP Frame Navigated Push [0x0C, len_hi, len_lo, ...url]
+        try {
+          let newUrl = "";
+          if (data.length >= 3) {
+            const len = (data[1] << 8) | data[2];
+            if (data.length >= 3 + len && len > 0) {
+              newUrl = new TextDecoder().decode(data.slice(3, 3 + len));
+            }
+          }
+          if (!newUrl) {
+            try {
+              const json = JSON.parse(new TextDecoder().decode(data.slice(1)));
+              if (json.url) newUrl = json.url;
+            } catch {
+              newUrl = new TextDecoder().decode(data.slice(1));
+            }
+          }
+          if (newUrl) {
+            setUrlBar(newUrl);
+          }
+        } catch {
+          // Ignore decode error
+        }
+      } else if (data[0] === 128) {
+        // Opcode 128: Floor control granted
+        try {
+          const json = JSON.parse(new TextDecoder().decode(data.slice(1)));
+          if (json.controllerId === userId) {
+            setHasControl(true);
+          } else if (json.controllerId === null) {
+            setHasControl(false);
+          }
+        } catch {}
+      } else if (data[0] === 129) {
+        // Opcode 129: Full control state broadcast
+        try {
+          const json = JSON.parse(new TextDecoder().decode(data.slice(1)));
+          if (json.activeControllerId === userId) {
+            setHasControl(true);
+          } else if (!json.activeControllerId) {
+            setHasControl(false);
+          }
+        } catch {}
+      } else if (data[0] === 0x12) {
+        // Opcode 18 (0x12): Floor status broadcast [0x12, state_u8, len_u8, ...controllerId_utf8]
+        try {
+          if (data.length >= 3) {
+            const len = data[2];
+            if (data.length >= 3 + len) {
+              const activeId = new TextDecoder().decode(data.slice(3, 3 + len));
+              setHasControl(activeId === userId);
+            }
+          }
+        } catch {}
       }
     };
 
@@ -123,19 +240,8 @@ export function VirtualBrowser({
       }
     };
 
-    // URL bar polling
-    const urlInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        fetch(`${vmUrl}/url`)
-          .then((r) => r.json())
-          .then((d) => { if (d.url && d.url !== urlBar) setUrlBar(d.url); })
-          .catch(() => {});
-      }
-    }, 3000);
-
     return () => {
       cancelled = true;
-      clearInterval(urlInterval);
       ws.close();
       wsRef.current = null;
     };
@@ -145,31 +251,23 @@ export function VirtualBrowser({
   // Auto-request control
   useEffect(() => {
     if (!controllerId && !controlQueue.includes(userId)) {
-      const timer = setTimeout(() => onRequestControl(), 1500);
+      const timer = setTimeout(() => requestFloorControl(), 1500);
       return () => clearTimeout(timer);
     }
   }, []);
   // eslint-disable-next-line react-hooks/exhaustive-deps
 
-  // Helper to send WS messages
-  const sendMsg = (type: number, payload: Record<string, unknown>) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      const encoded = new TextEncoder().encode(JSON.stringify(payload));
-      const msg = new Uint8Array(1 + encoded.length);
-      msg[0] = type;
-      msg.set(encoded, 1);
-      wsRef.current.send(msg);
-    }
-  };
-
-  // Normalized coordinates (0.0 to 1.0) — as specified in the research report
+  // Normalized coordinates (strictly clamped to [0.0, 1.0])
   const getNormalizedCoords = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const rawX = (e.clientX - rect.left) / rect.width;
+    const rawY = (e.clientY - rect.top) / rect.height;
     return {
-      x: (e.clientX - rect.left) / rect.width,
-      y: (e.clientY - rect.top) / rect.height,
+      x: Math.min(1.0, Math.max(0.0, Number.isFinite(rawX) ? rawX : 0.0)),
+      y: Math.min(1.0, Math.max(0.0, Number.isFinite(rawY) ? rawY : 0.0)),
     };
   };
 
@@ -278,7 +376,7 @@ export function VirtualBrowser({
         )}
 
         {isController ? (
-          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={onReleaseControl}>
+          <Button size="sm" variant="destructive" className="h-7 gap-1 text-xs" onClick={releaseFloorControl}>
             <Unlock className="h-3 w-3" /> Release
           </Button>
         ) : controllerId ? (
@@ -287,12 +385,12 @@ export function VirtualBrowser({
               <Hand className="h-3 w-3" /> Queue #{queuePosition + 1}
             </span>
           ) : (
-            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
+            <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={requestFloorControl}>
               <Hand className="h-3 w-3" /> Request
             </Button>
           )
         ) : (
-          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={onRequestControl}>
+          <Button size="sm" variant="outline" className="h-7 gap-1 text-xs" onClick={requestFloorControl}>
             <Lock className="h-3 w-3" /> Take control
           </Button>
         )}
