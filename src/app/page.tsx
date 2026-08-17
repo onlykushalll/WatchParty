@@ -8,7 +8,6 @@ import { ChatPanel } from "@/components/watchparty/chat-panel";
 import { QueuePanel } from "@/components/watchparty/queue-panel";
 import { CallsPanel } from "@/components/watchparty/calls-panel";
 import { StreamPlayer } from "@/components/watchparty/stream-player";
-import { TorrentPlayer } from "@/components/watchparty/torrent-player";
 import { SyncIndicator } from "@/components/watchparty/participants-list";
 
 import { Button } from "@/components/ui/button";
@@ -377,7 +376,7 @@ function RoomView({
   const [urlInput, setUrlInput] = useState("");
   const [copied, setCopied] = useState(false);
   const [tab, setTab] = useState<"chat" | "queue" | "calls">("chat");
-  const [mode, setMode] = useState<"video" | "vm" | "cinevo" | "stream" | "torrent">("video");
+  const [mode, setMode] = useState<"video" | "vm" | "cinevo" | "stream">("video");
 
   // CineVo mode state
   const [cinevoUrl, setCinevoUrl] = useState("");
@@ -502,15 +501,7 @@ function RoomView({
               mode === "stream" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            <Radio className="h-3 w-3" /> Stream
-          </button>
-          <button
-            onClick={() => setMode("torrent")}
-            className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-semibold transition-all ${
-              mode === "torrent" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            <Globe className="h-3 w-3" /> Torrent
+            <Radio className="h-3 w-3" /> P2P Stream
           </button>
         </div>
 
@@ -694,26 +685,8 @@ function RoomView({
                 participants={engine.participants.length}
                 sourceUrl={engine.source?.url}
               />
-            ) : mode === "stream" ? (
-              <StreamPlayer
-                playback={engine.playback}
-                clockOffset={engine.stats.clockOffset}
-                onIntent={engine.sendIntent}
-                cmdPlay={engine.cmdPlay}
-                cmdPause={engine.cmdPause}
-                cmdSeek={engine.cmdSeek}
-                socket={engine.socket}
-                userId={userId}
-                participantIds={engine.participants.map((p) => p.userId)}
-                isHost={!!engine.you?.isHost && !engine.streamHost}
-                onStreamStart={(fileName) => {
-                  toast.success(`Streaming "${fileName}" to everyone via WebRTC`);
-                }}
-                streamingHostId={engine.streamHost?.userId || null}
-                streamingFileName={engine.streamHost?.fileName || null}
-              />
             ) : (
-              <TorrentPlayer
+              <StreamPlayer
                 playback={engine.playback}
                 clockOffset={engine.stats.clockOffset}
                 onIntent={engine.sendIntent}
@@ -723,12 +696,19 @@ function RoomView({
                 cmdTs={engine.cmdTs}
                 remoteCmd={engine.remoteCmd}
                 tsMap={engine.tsMap}
+                socket={engine.socket}
                 userId={userId}
-                isHost={!!engine.you?.isHost}
+                participantIds={engine.participants.map((p) => p.userId)}
+                isHost={!!engine.you?.isHost && !engine.streamHost}
+                onStreamStart={(fileName) => {
+                  toast.success(`Streaming "${fileName}" via WebRTC + WebTorrent P2P`);
+                }}
                 onSeedFile={(magnetURI, fileName) => {
                   engine.sendIntent({ videoUrl: magnetURI, videoType: "torrent", fileName });
                   toast.success(`Seeding "${fileName}" to room via WebTorrent`);
                 }}
+                streamingHostId={engine.streamHost?.userId || null}
+                streamingFileName={engine.streamHost?.fileName || null}
               />
             )}
           </div>

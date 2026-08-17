@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -13,37 +14,123 @@ import {
   Loader2,
   Upload,
   AlertCircle,
-  Wifi,
+  Users,
   Radio,
+  Globe,
+  Zap,
+  ArrowRight,
 } from "lucide-react";
 import { useWebRTCStream } from "@/lib/webrtc/use-webrtc-stream";
 import { PlaybackState } from "@/lib/sync/types";
+import { useVideoController } from "@/lib/sync/use-video-controller";
 
 interface StreamPlayerProps {
   playback: PlaybackState | null;
   clockOffset: number;
-  onIntent: (patch: Partial<{
-    isPlaying: boolean;
-    currentTime: number;
-    playbackRate: number;
-  }>) => void;
-  // Command-relay props (for chat log + state sync)
-  cmdPlay?: () => void;
-  cmdPause?: () => void;
-  cmdSeek?: (time: number, playing: boolean) => void;
+  onIntent: (patch: Partial<PlaybackState>) => void;
+  // Command-relay props
+  cmdPlay?: (time?: number) => void;
+  cmdPause?: (time?: number) => void;
+  cmdSeek?: (time: number, playing?: boolean) => void;
+  cmdTs?: (time: number) => void;
+  remoteCmd?: {
+    play: { by: string; ts: number } | null;
+    pause: { by: string; ts: number } | null;
+    seek: { time: number; playing: boolean; by: string } | null;
+  };
+  tsMap?: Record<string, number>;
   // The raw socket for WebRTC signaling
   socket: any;
   userId: string;
-  // List of participant userIds (so host can create peers for new viewers)
+  // List of participant userIds
   participantIds: string[];
-  // Whether this user is the host (has the file)
+  // Whether this user is the host
   isHost: boolean;
-  // Host: called when they pick a file (to update room state)
   onStreamStart?: (fileName: string) => void;
   onStreamStop?: () => void;
-  // Viewer: the host's userId (who is streaming)
+  onSeedFile?: (magnetURI: string, fileName: string) => void;
   streamingHostId: string | null;
   streamingFileName: string | null;
+}
+
+let wtClient: any = null;
+let wtLoadPromise: Promise<any> | null = null;
+
+function loadWebTorrent(): Promise<any> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("WebTorrent is only supported in browser"));
+  }
+  const w = window as any;
+  if (wtClient) return Promise.resolve(wtClient);
+  if (w.WebTorrent) {
+    const WT = w.WebTorrent;
+    wtClient = new WT({
+      tracker: {
+        rtcConfig: {
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:global.stun.twilio.com:3478" },
+          ],
+        },
+      },
+    });
+    return Promise.resolve(wtClient);
+  }
+  if (wtLoadPromise) return wtLoadPromise;
+
+  wtLoadPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById("webtorrent-script");
+    if (existing) {
+      const check = setInterval(() => {
+        if (w.WebTorrent) {
+          clearInterval(check);
+          const WT = w.WebTorrent;
+          wtClient = new WT({
+            tracker: {
+              rtcConfig: {
+                iceServers: [
+                  { urls: "stun:stun.l.google.com:19302" },
+                  { urls: "stun:global.stun.twilio.com:3478" },
+                ],
+              },
+            },
+          });
+          resolve(wtClient);
+        }
+      }, 50);
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = "webtorrent-script";
+    script.src = "https://cdn.jsdelivr.net/npm/webtorrent@latest/webtorrent.min.js";
+    script.async = true;
+    script.onload = () => {
+      if (w.WebTorrent) {
+        const WT = w.WebTorrent;
+        wtClient = new WT({
+          tracker: {
+            rtcConfig: {
+              iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:global.stun.twilio.com:3478" },
+              ],
+            },
+          },
+        });
+        resolve(wtClient);
+      } else {
+        reject(new Error("WebTorrent library failed to load"));
+      }
+    };
+    script.onerror = () => {
+      wtLoadPromise = null;
+      reject(new Error("Failed to load WebTorrent from CDN"));
+    };
+    document.head.appendChild(script);
+  });
+
+  return wtLoadPromise;
 }
 
 export function StreamPlayer({
@@ -53,63 +140,154 @@ export function StreamPlayer({
   cmdPlay,
   cmdPause,
   cmdSeek,
+  cmdTs,
+  remoteCmd,
+  tsMap,
   socket,
   userId,
   participantIds,
   isHost,
   onStreamStart,
   onStreamStop,
+  onSeedFile,
   streamingHostId,
   streamingFileName,
 }: StreamPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const torrentRef = useRef<any>(null);
+  const seedingRef = useRef<any>(null);
 
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string>("");
+  const [magnetInput, setMagnetInput] = useState<string>("");
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
   const [localTime, setLocalTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [fullscreen, setFullscreen] = useState(false);
   const [showControls, setShowControls] = useState(true);
+  const [streamType, setStreamType] = useState<"webrtc" | "torrent" | "direct">("webrtc");
+  const [torrentPeers, setTorrentPeers] = useState(0);
 
-  // WebRTC hook — handles both host (captureStream + send) and viewer (receive)
+  const magnetURI = playback?.videoUrl || "";
+  const isMagnet = magnetURI.startsWith("magnet:") || magnetURI.startsWith("webtorrent:");
+
+  // WebRTC hook — handles peer mesh streaming
   const webrtc = useWebRTCStream({
     socket,
     userId,
-    sourceVideoRef: videoRef, // host: captures from this
-    destVideoRef: videoRef,   // viewer: plays received stream here
+    sourceVideoRef: videoRef,
+    destVideoRef: videoRef,
     isHost,
   });
 
-  // ── HOST: pick a file and start streaming ──
+  // State synchronization controller
+  useVideoController({
+    videoRef,
+    playback,
+    clockOffset,
+    onIntent,
+    cmdPlay: (t) => cmdPlay?.(t),
+    cmdPause: (t) => cmdPause?.(t),
+    cmdSeek: (t) => cmdSeek?.(t, playback?.isPlaying || false),
+    cmdTs,
+    remoteCmd,
+    tsMap,
+    userId,
+  });
+
+  // ── HOST: Pick a file and broadcast via WebRTC + WebTorrent ──
   const handleFilePick = useCallback(async (file: File) => {
     setError(null);
+    setStatus(`Loading "${file.name}" (${(file.size / 1024 / 1024).toFixed(1)} MB)…`);
+
     const url = URL.createObjectURL(file);
-    // Wait for the video element to be available (it's always rendered, just hidden)
     const v = videoRef.current;
     if (!v) {
-      setError("Video element not ready");
+      setError("Video element not initialized");
       return;
     }
+
+    // 1. Instant local playback for host
     v.src = url;
-    v.muted = true;
+    v.muted = false;
+    setMuted(false);
     v.play().then(() => {
       setReady(true);
       setDuration(v.duration || 0);
+      setStreamType("webrtc");
       webrtc.startStreaming(file.name);
       onStreamStart?.(file.name);
-    }).catch((e) => {
-      setError("Failed to play file: " + e.message);
+    }).catch(() => {
+      // Autoplay with audio blocked fallback
+      v.muted = true;
+      setMuted(true);
+      v.play().catch(() => {});
+      setReady(true);
+      webrtc.startStreaming(file.name);
+      onStreamStart?.(file.name);
     });
-  }, [webrtc, onStreamStart]);
 
-  // ── HOST: create peer connections for new viewers ──
+    // 2. Background WebTorrent Seeding (for swarm caching & large file delivery)
+    try {
+      const client = await loadWebTorrent();
+      client.seed(file, (torrent: any) => {
+        seedingRef.current = torrent;
+        const magnet = torrent.magnetURI;
+        setTorrentPeers(torrent.numPeers);
+        onSeedFile?.(magnet, file.name);
+
+        torrent.on("wire", () => setTorrentPeers(torrent.numPeers));
+        torrent.on("upload", () => {
+          const speed = Math.round(torrent.uploadSpeed / 1024);
+          setStatus(`P2P Seeding — ${torrent.numPeers} peer(s), ↑ ${speed} KB/s`);
+        });
+      });
+    } catch (e) {
+      console.warn("Background WebTorrent notice:", e);
+    }
+  }, [webrtc, onStreamStart, onSeedFile]);
+
+  // ── HOST: Handle Magnet Link input ──
+  const handleMagnetSubmit = useCallback(async (uri: string) => {
+    const clean = uri.trim();
+    if (!clean) return;
+    setError(null);
+    setStatus("Connecting to magnet swarm…");
+
+    try {
+      const client = await loadWebTorrent();
+      const torrent = client.add(clean, (t: any) => {
+        setStatus(`Streaming torrent — ${t.numPeers} peer(s)`);
+        const v = videoRef.current;
+        if (!v) return;
+        const file = (t.files || []).sort((a: any, b: any) => b.length - a.length)[0] || t.files[0];
+        if (file) {
+          setReady(true);
+          setStreamType("torrent");
+          if (typeof file.renderTo === "function") {
+            file.renderTo(v, { autoplay: false }, () => {
+              setDuration(v.duration || 0);
+            });
+          } else if (typeof file.streamTo === "function") {
+            file.streamTo(v).then(() => setDuration(v.duration || 0));
+          }
+        }
+      });
+      torrentRef.current = torrent;
+      onIntent({ videoUrl: clean, videoType: "torrent" });
+      onSeedFile?.(clean, "Magnet Stream");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load magnet");
+    }
+  }, [onIntent, onSeedFile]);
+
+  // ── HOST: Create peer connections for new room viewers ──
   useEffect(() => {
     if (!isHost || !webrtc.streaming) return;
-    // Create peers for any viewer who doesn't have one yet
     participantIds.forEach((pid) => {
       if (pid !== userId && !webrtc.peers.find((p) => p.userId === pid)) {
         webrtc.createHostPeer(pid);
@@ -117,10 +295,69 @@ export function StreamPlayer({
     });
   }, [isHost, webrtc.streaming, participantIds, userId, webrtc.peers, webrtc.createHostPeer]);
 
-  // ── Track local time + duration (host only) ──
+  // ── VIEWER: Connect to Magnet if room switched to torrent ──
+  useEffect(() => {
+    if (isHost || !isMagnet || seedingRef.current) return;
+    let cancelled = false;
+    setError(null);
+    setStatus("Connecting to P2P swarm…");
+
+    loadWebTorrent().then((client) => {
+      if (cancelled) return;
+      const torrent = client.add(magnetURI, (t: any) => {
+        if (cancelled) return;
+        const v = videoRef.current;
+        if (!v) return;
+        const file = (t.files || []).sort((a: any, b: any) => b.length - a.length)[0] || t.files[0];
+        if (file) {
+          setReady(true);
+          setStreamType("torrent");
+          if (typeof file.renderTo === "function") {
+            file.renderTo(v, { autoplay: false }, () => {
+              setDuration(v.duration || 0);
+              setStatus(`Streaming — ${t.numPeers} peer(s)`);
+            });
+          } else if (typeof file.streamTo === "function") {
+            file.streamTo(v).then(() => {
+              setDuration(v.duration || 0);
+              setStatus(`Streaming — ${t.numPeers} peer(s)`);
+            });
+          }
+        }
+      });
+      torrentRef.current = torrent;
+      torrent.on("download", () => {
+        if (cancelled) return;
+        setTorrentPeers(torrent.numPeers);
+        setStatus(`Streaming — ${torrent.numPeers} peer(s), ↓ ${Math.round(torrent.downloadSpeed / 1024)} KB/s`);
+      });
+      torrent.on("wire", () => {
+        if (cancelled) return;
+        setTorrentPeers(torrent.numPeers);
+      });
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (torrentRef.current) {
+        try { torrentRef.current.destroy(); } catch {}
+        torrentRef.current = null;
+      }
+    };
+  }, [magnetURI, isHost, isMagnet]);
+
+  // ── VIEWER: Auto-detect WebRTC stream from host ──
+  useEffect(() => {
+    if (!isHost && webrtc.connected && !ready && !isMagnet) {
+      setReady(true);
+      setStreamType("webrtc");
+    }
+  }, [isHost, webrtc.connected, ready, isMagnet]);
+
+  // ── Track local video time ──
   useEffect(() => {
     const v = videoRef.current;
-    if (!v || !isHost) return;
+    if (!v) return;
     const onTime = () => setLocalTime(v.currentTime);
     const onDur = () => setDuration(v.duration || 0);
     v.addEventListener("timeupdate", onTime);
@@ -131,27 +368,26 @@ export function StreamPlayer({
       v.removeEventListener("durationchange", onDur);
       v.removeEventListener("loadedmetadata", onDur);
     };
-  }, [isHost]);
+  }, []);
 
-  // ── Fullscreen ──
+  // ── Fullscreen handler ──
   useEffect(() => {
     const onFs = () => setFullscreen(!!document.fullscreenElement);
     document.addEventListener("fullscreenchange", onFs);
     return () => document.removeEventListener("fullscreenchange", onFs);
   }, []);
 
-  // ── Controls (host only — viewers can't control the live stream) ──
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
-    if (!v || !isHost) return;
+    if (!v) return;
     if (v.paused) {
-      v.play().catch(() => {});
-      cmdPlay?.();
+      v.play().catch(() => { v.muted = true; v.play().catch(() => {}); });
+      cmdPlay?.(v.currentTime);
     } else {
       v.pause();
-      cmdPause?.();
+      cmdPause?.(v.currentTime);
     }
-  }, [isHost, cmdPlay, cmdPause]);
+  }, [cmdPlay, cmdPause]);
 
   const toggleMute = useCallback(() => {
     const v = videoRef.current;
@@ -174,176 +410,176 @@ export function StreamPlayer({
   const onSeek = useCallback((val: number[]) => {
     const t = val[0];
     const v = videoRef.current;
-    if (!v || !isHost) return;
-    v.currentTime = t;
-    setLocalTime(t);
-    cmdSeek?.(t, !v.paused);
-  }, [isHost, cmdSeek]);
+    if (v && Number.isFinite(t)) {
+      v.currentTime = t;
+      cmdSeek?.(t, !v.paused);
+    }
+  }, [cmdSeek]);
 
   const toggleFullscreen = useCallback(() => {
+    if (!wrapRef.current) return;
     if (!document.fullscreenElement) {
-      wrapRef.current?.requestFullscreen?.().catch(() => {});
+      wrapRef.current.requestFullscreen().catch(() => {});
     } else {
-      document.exitFullscreen?.().catch(() => {});
+      document.exitFullscreen().catch(() => {});
     }
   }, []);
 
-  // Auto-hide controls
-  useEffect(() => {
-    const t = setTimeout(() => {
-      if (playback?.isPlaying) setShowControls(false);
-    }, 3000);
-    return () => clearTimeout(t);
-  }, [playback?.isPlaying, localTime]);
-
-  // Always render the video element (hidden when not streaming) so refs work
-  const showFilePicker = isHost && !webrtc.streaming && !webrtc.error;
-  const showWaiting = !isHost && !webrtc.streaming && !streamingHostId;
-  const showConnecting = !isHost && !webrtc.remoteStream && !!streamingHostId;
+  const activePeerCount = isHost ? webrtc.peers.length + torrentPeers : webrtc.peers.length + torrentPeers;
 
   return (
     <div
       ref={wrapRef}
-      className="group relative h-full w-full overflow-hidden bg-black"
       onMouseMove={() => setShowControls(true)}
+      className="group relative flex h-full w-full items-center justify-center bg-black overflow-hidden select-none"
     >
-      {/* Always-rendered video element (host: plays local file; viewer: plays remote stream) */}
-      <video
-        ref={videoRef}
-        className="absolute inset-0 h-full w-full bg-black object-contain"
-        playsInline
-        autoPlay
-        onClick={togglePlay}
-        onDoubleClick={toggleFullscreen}
-        style={{ objectFit: "contain", visibility: (webrtc.streaming || ready) ? "visible" : "hidden" }}
-      />
+      {/* ── Strict 16:9 widescreen stage container ── */}
+      <div className="relative w-full h-full max-w-[calc(100vh*16/9)] max-h-[calc(100vw*9/16)] aspect-video flex items-center justify-center bg-black">
+        {/* Video Element */}
+        <video
+          ref={videoRef}
+          playsInline
+          className={`h-full w-full object-contain ${ready ? "block" : "hidden"}`}
+        />
 
-      {/* HOST: file picker overlay */}
-      {showFilePicker && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black p-6">
-          <div className="max-w-md text-center">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-violet-500/10">
-              <Upload className="h-7 w-7 text-violet-400" />
-            </div>
-            <p className="text-sm font-semibold text-white">
-              Stream a movie to everyone
-            </p>
-            <p className="mt-1.5 text-xs text-white/50">
-              Pick a video file from your device. It&apos;ll stream directly to all
-              viewers in real-time via WebRTC. Only you need the file — viewers
-              never download it.
-            </p>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="video/*"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleFilePick(f);
-              }}
-            />
-            <Button
-              className="mt-4 gap-2"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload className="h-4 w-4" /> Choose movie file
-            </Button>
-            <p className="mt-3 text-[10px] text-white/30">
-              Supports MP4, WebM, MKV — anything your browser can play.
-              <br />Latency: ~200-500ms · Sync: automatic (shared stream)
-            </p>
+        {/* Not Ready: Host File/Magnet Picker or Viewer Waiting Screen */}
+        {!ready && (
+          <div className="flex h-full w-full flex-col items-center justify-center p-6 text-center">
+            {isHost ? (
+              <div className="max-w-md space-y-5">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 shadow-lg shadow-violet-500/30 text-white">
+                  <Radio className="h-8 w-8" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-bold text-white tracking-tight">P2P File & Torrent Stream</h3>
+                  <p className="mt-1 text-xs text-zinc-400">
+                    Stream local movie files or magnet links directly to everyone in your room via zero-lag WebRTC peer mesh and WebTorrent swarms.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl bg-primary px-4 py-3 text-xs font-bold text-primary-foreground shadow-lg hover:bg-primary/90 transition-colors">
+                    <Upload className="h-4 w-4" /> Pick Video File to Stream
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="video/*"
+                      className="hidden"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0];
+                        if (f) handleFilePick(f);
+                      }}
+                    />
+                  </label>
+
+                  <div className="flex items-center gap-2">
+                    <div className="h-px flex-1 bg-zinc-800" />
+                    <span className="text-[10px] uppercase font-semibold text-zinc-500">or enter magnet link</span>
+                    <div className="h-px flex-1 bg-zinc-800" />
+                  </div>
+
+                  <div className="flex gap-2">
+                    <Input
+                      value={magnetInput}
+                      onChange={(e) => setMagnetInput(e.target.value)}
+                      placeholder="magnet:?xt=urn:btih:..."
+                      className="text-xs bg-zinc-900/80 border-zinc-800"
+                      onKeyDown={(e) => e.key === "Enter" && handleMagnetSubmit(magnetInput)}
+                    />
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="text-xs shrink-0 gap-1"
+                      onClick={() => handleMagnetSubmit(magnetInput)}
+                    >
+                      <Globe className="h-3 w-3" /> Stream <ArrowRight className="h-3 w-3" />
+                    </Button>
+                  </div>
+                </div>
+
+                {status && (
+                  <div className="flex items-center justify-center gap-2 text-xs text-primary animate-pulse">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>{status}</span>
+                  </div>
+                )}
+                {error && (
+                  <div className="flex items-center justify-center gap-2 text-xs text-rose-400">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    <span>{error}</span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="max-w-md space-y-4">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-zinc-800 text-zinc-400 animate-pulse">
+                  <Radio className="h-8 w-8 text-primary" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">
+                    {streamingHostId ? "Connecting to Host Stream…" : "Waiting for Host"}
+                  </h3>
+                  <p className="mt-1 text-xs text-zinc-400">
+                    {streamingHostId
+                      ? `Receiving "${streamingFileName || "live media stream"}" over peer-to-peer connection…`
+                      : "The host has not started a P2P stream yet. When they pick a file or torrent, it will play here automatically."}
+                  </p>
+                </div>
+                {streamingHostId && (
+                  <div className="flex items-center justify-center gap-2 text-xs text-primary">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>Connecting WebRTC peer mesh…</span>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
-        </div>
-      )}
-
-      {/* VIEWER: waiting for host */}
-      {showWaiting && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black p-6">
-          <div className="max-w-md text-center">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-white/5">
-              <Loader2 className="h-7 w-7 animate-spin text-white/50" />
-            </div>
-            <p className="text-sm font-medium text-white/70">
-              Waiting for host to start the movie…
-            </p>
-            <p className="mt-1 text-xs text-white/40">
-              The stream will appear here automatically.
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* VIEWER: connecting */}
-      {showConnecting && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black p-6">
-          <div className="max-w-md text-center">
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-violet-500/10">
-              <Radio className="h-7 w-7 animate-pulse text-violet-400" />
-            </div>
-            <p className="text-sm font-medium text-white">
-              Connecting to host&apos;s stream…
-            </p>
-            <p className="mt-1 text-xs text-white/50">
-              {streamingFileName ? `Waiting for "${streamingFileName}"` : "Establishing WebRTC connection"}
-            </p>
-          </div>
-        </div>
-      )}
-
-      {/* Error */}
-      {webrtc.error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80 p-6">
-          <div className="max-w-md text-center">
-            <AlertCircle className="mx-auto mb-3 h-10 w-10 text-rose-400" />
-            <p className="text-sm font-medium text-white">Streaming error</p>
-            <p className="mt-1 text-xs text-white/60">{webrtc.error}</p>
-          </div>
-        </div>
-      )}
-
-      {/* Status bar (top) */}
-      <div className="absolute left-3 top-3 flex items-center gap-2">
-        {isHost ? (
-          <Badge variant="secondary" className="gap-1 bg-violet-600 text-white backdrop-blur">
-            <Radio className="h-3 w-3" /> Hosting
-          </Badge>
-        ) : (
-          <Badge variant="secondary" className="gap-1 bg-emerald-600 text-white backdrop-blur">
-            <Wifi className="h-3 w-3" /> Live
-          </Badge>
-        )}
-        {webrtc.peers.length > 0 && (
-          <Badge variant="secondary" className="gap-1 bg-black/60 text-white backdrop-blur">
-            <Wifi className="h-3 w-3" /> {webrtc.peers.length} peer{webrtc.peers.length !== 1 ? "s" : ""}
-          </Badge>
-        )}
-        {webrtc.fileName && (
-          <Badge variant="secondary" className="max-w-[200px] truncate bg-black/60 text-white backdrop-blur">
-            {webrtc.fileName}
-          </Badge>
         )}
       </div>
 
-      {/* Controls (bottom) — host only, viewers can't control live stream */}
-      {isHost && ready && showControls && (
-        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-3 pt-8">
-          <div className="mb-2 flex items-center gap-2">
-            <span className="text-xs tabular-nums text-white/80">
-              {fmtTime(localTime)}
-            </span>
-            <Slider
-              value={[localTime]}
-              min={0}
-              max={duration || 100}
-              step={0.1}
-              onValueChange={onSeek}
-              className="flex-1"
-            />
-            <span className="text-xs tabular-nums text-white/80">
-              {fmtTime(duration)}
-            </span>
-          </div>
+      {/* ── Top Live Stream Badges ── */}
+      {ready && (
+        <div className="absolute top-3 left-3 z-20 flex items-center gap-2 pointer-events-none">
+          <Badge variant="default" className="gap-1.5 bg-violet-600/90 text-white backdrop-blur shadow-sm">
+            <Radio className="h-3 w-3 animate-pulse text-emerald-300" />
+            <span>P2P Stream</span>
+          </Badge>
+          <Badge variant="secondary" className="gap-1 bg-black/60 text-zinc-300 backdrop-blur border-0">
+            <Users className="h-3 w-3 text-primary" />
+            <span>{Math.max(1, activePeerCount)} connected</span>
+          </Badge>
+          {isHost && (
+            <Badge variant="outline" className="text-[10px] bg-black/40 border-violet-500/40 text-violet-300">
+              Host Broadcaster
+            </Badge>
+          )}
+        </div>
+      )}
+
+      {/* ── Hover Controls Bar ── */}
+      {ready && (
+        <div
+          className={`absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/90 via-black/50 to-transparent p-4 transition-opacity duration-200 ${
+            showControls ? "opacity-100" : "opacity-0"
+          }`}
+        >
+          {duration > 0 && (
+            <div className="mb-2 flex items-center gap-3">
+              <div className="flex-1">
+                <Slider
+                  value={[localTime]}
+                  min={0}
+                  max={duration}
+                  step={0.1}
+                  onValueChange={onSeek}
+                />
+              </div>
+              <span className="font-mono text-xs text-white/80">
+                {fmtTime(localTime)} / {fmtTime(duration)}
+              </span>
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="icon" onClick={togglePlay} className="text-white hover:bg-white/10">
               {playback?.isPlaying ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
@@ -361,27 +597,15 @@ export function StreamPlayer({
               />
             </div>
             <div className="ml-auto flex items-center gap-2">
+              {status && (
+                <span className="text-[10px] text-zinc-400 font-mono hidden sm:inline">{status}</span>
+              )}
               <Button variant="ghost" size="icon" onClick={toggleFullscreen} className="text-white hover:bg-white/10">
                 <Maximize className="h-5 w-5" />
               </Button>
             </div>
           </div>
         </div>
-      )}
-
-      {/* Viewer: tap-to-unmute overlay (autoplay policy) */}
-      {!isHost && webrtc.remoteStream && muted && (
-        <button
-          className="absolute inset-0 flex items-center justify-center bg-black/40"
-          onClick={() => {
-            const v = videoRef.current;
-            if (v) { v.muted = false; setMuted(false); }
-          }}
-        >
-          <div className="rounded-full bg-white/10 p-4 backdrop-blur">
-            <Volume2 className="h-8 w-8 text-white" />
-          </div>
-        </button>
       )}
     </div>
   );
@@ -392,7 +616,8 @@ function fmtTime(s: number): string {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = Math.floor(s % 60);
-  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
-  const ss = String(sec).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  }
+  return `${m}:${sec.toString().padStart(2, "0")}`;
 }
