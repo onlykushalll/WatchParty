@@ -29,10 +29,10 @@ interface StreamPlayerProps {
   clockOffset: number;
   onIntent: (patch: Partial<PlaybackState>) => void;
   // Command-relay props
-  cmdPlay?: (time?: number) => void;
-  cmdPause?: (time?: number) => void;
-  cmdSeek?: (time: number, playing?: boolean) => void;
-  cmdTs?: (time: number) => void;
+  cmdPlay?: () => void;
+  cmdPause?: () => void;
+  cmdSeek?: (time: number, playing: boolean) => void;
+  cmdTs?: (ts: number) => void;
   remoteCmd?: {
     play: { by: string; ts: number } | null;
     pause: { by: string; ts: number } | null;
@@ -190,9 +190,9 @@ export function StreamPlayer({
     playback,
     clockOffset,
     onIntent,
-    cmdPlay: (t) => cmdPlay?.(t),
-    cmdPause: (t) => cmdPause?.(t),
-    cmdSeek: (t) => cmdSeek?.(t, playback?.isPlaying || false),
+    cmdPlay,
+    cmdPause,
+    cmdSeek,
     cmdTs,
     remoteCmd,
     tsMap,
@@ -348,11 +348,11 @@ export function StreamPlayer({
 
   // ── VIEWER: Auto-detect WebRTC stream from host ──
   useEffect(() => {
-    if (!isHost && webrtc.connected && !ready && !isMagnet) {
+    if (!isHost && webrtc.remoteStream && !ready && !isMagnet) {
       setReady(true);
       setStreamType("webrtc");
     }
-  }, [isHost, webrtc.connected, ready, isMagnet]);
+  }, [isHost, webrtc.remoteStream, ready, isMagnet]);
 
   // ── Track local video time ──
   useEffect(() => {
@@ -382,10 +382,10 @@ export function StreamPlayer({
     if (!v) return;
     if (v.paused) {
       v.play().catch(() => { v.muted = true; v.play().catch(() => {}); });
-      cmdPlay?.(v.currentTime);
+      cmdPlay?.();
     } else {
       v.pause();
-      cmdPause?.(v.currentTime);
+      cmdPause?.();
     }
   }, [cmdPlay, cmdPause]);
 

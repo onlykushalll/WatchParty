@@ -23,10 +23,10 @@ interface TorrentPlayerProps {
   clockOffset: number;
   onIntent: (intent: Partial<PlaybackState>) => void;
   // Local file / command sync
-  cmdPlay?: (time: number) => void;
-  cmdPause?: (time: number) => void;
-  cmdSeek?: (time: number) => void;
-  cmdTs?: (time: number) => void;
+  cmdPlay?: () => void;
+  cmdPause?: () => void;
+  cmdSeek?: (time: number, playing: boolean) => void;
+  cmdTs?: (ts: number) => void;
   remoteCmd?: {
     play: { by: string; ts: number } | null;
     pause: { by: string; ts: number } | null;
@@ -352,7 +352,7 @@ export function TorrentPlayer({
     const v = videoRef.current;
     if (v && Number.isFinite(t)) {
       v.currentTime = t;
-      cmdSeek?.(t);
+      cmdSeek?.(t, !v.paused);
     }
   }, [cmdSeek]);
 
