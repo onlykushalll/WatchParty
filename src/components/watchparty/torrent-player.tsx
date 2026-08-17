@@ -1,37 +1,34 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Button } from "@/components/ui/button";
+import { PlaybackState } from "@/lib/sync/types";
+import { useVideoController } from "@/lib/sync/use-video-controller";
 import { Slider } from "@/components/ui/slider";
-import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Play,
   Pause,
   Volume2,
   VolumeX,
   Maximize,
-  Loader2,
   Upload,
-  AlertCircle,
-  Wifi,
+  Radio,
   Users,
+  Film,
+  Globe,
+  Loader2,
+  AlertCircle,
 } from "lucide-react";
-import { useVideoController } from "@/lib/sync/use-video-controller";
-import { PlaybackState } from "@/lib/sync/types";
 
 interface TorrentPlayerProps {
   playback: PlaybackState | null;
   clockOffset: number;
-  onIntent: (patch: Partial<{
-    isPlaying: boolean;
-    currentTime: number;
-    playbackRate: number;
-  }>) => void;
-  // Command-relay props
-  cmdPlay?: () => void;
-  cmdPause?: () => void;
-  cmdSeek?: (time: number, playing: boolean) => void;
-  cmdTs?: (ts: number) => void;
+  onIntent: (intent: Partial<PlaybackState>) => void;
+  // Local file / command sync
+  cmdPlay?: (time: number) => void;
+  cmdPause?: (time: number) => void;
+  cmdSeek?: (time: number) => void;
+  cmdTs?: (time: number) => void;
   remoteCmd?: {
     play: { by: string; ts: number } | null;
     pause: { by: string; ts: number } | null;
@@ -45,39 +42,84 @@ interface TorrentPlayerProps {
   isHost: boolean;
 }
 
-// WebTorrent is loaded from esm.sh (which serves the npm package as a
-// browser-ready ES module with all node polyfills handled). We use a runtime
-// import() via a variable so Turbopack doesn't try to resolve it at build time.
 let wtClient: any = null;
 let wtLoadPromise: Promise<any> | null = null;
 
 function loadWebTorrent(): Promise<any> {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("WebTorrent is only supported in browser environments"));
+  }
+  const w = window as any;
   if (wtClient) return Promise.resolve(wtClient);
-  if (wtLoadPromise) return wtLoadPromise;
-  // Use a variable so Turbopack/Next.js doesn't try to bundle this import
-  const pkg = "web" + "torrent";
-  const url = "https://esm.sh/" + pkg + "@3.0.21";
-  wtLoadPromise = (new Function("u", "return import(u)"))(url)
-    .then((mod: any) => {
-      const WebTorrent = mod.default || mod.WebTorrent || mod;
-      if (!WebTorrent) throw new Error("WebTorrent class not found");
-      wtClient = new WebTorrent({
-        tracker: {
-          rtcConfig: {
-            iceServers: [
-              { urls: "stun:stun.l.google.com:19302" },
-              { urls: "stun:global.stun.twilio.com:3478" },
-            ],
-          },
+  if (w.WebTorrent) {
+    const WT = w.WebTorrent;
+    wtClient = new WT({
+      tracker: {
+        rtcConfig: {
+          iceServers: [
+            { urls: "stun:stun.l.google.com:19302" },
+            { urls: "stun:global.stun.twilio.com:3478" },
+          ],
         },
-      });
-      return wtClient;
-    })
-    .catch((e) => {
-      wtLoadPromise = null;
-      throw e;
+      },
     });
-  return wtLoadPromise!;
+    return Promise.resolve(wtClient);
+  }
+  if (wtLoadPromise) return wtLoadPromise;
+
+  wtLoadPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById("webtorrent-script");
+    if (existing) {
+      const check = setInterval(() => {
+        if (w.WebTorrent) {
+          clearInterval(check);
+          const WT = w.WebTorrent;
+          wtClient = new WT({
+            tracker: {
+              rtcConfig: {
+                iceServers: [
+                  { urls: "stun:stun.l.google.com:19302" },
+                  { urls: "stun:global.stun.twilio.com:3478" },
+                ],
+              },
+            },
+          });
+          resolve(wtClient);
+        }
+      }, 50);
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = "webtorrent-script";
+    script.src = "https://cdn.jsdelivr.net/npm/webtorrent@latest/webtorrent.min.js";
+    script.async = true;
+    script.onload = () => {
+      if (w.WebTorrent) {
+        const WT = w.WebTorrent;
+        wtClient = new WT({
+          tracker: {
+            rtcConfig: {
+              iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:global.stun.twilio.com:3478" },
+              ],
+            },
+          },
+        });
+        resolve(wtClient);
+      } else {
+        reject(new Error("WebTorrent library failed to load"));
+      }
+    };
+    script.onerror = () => {
+      wtLoadPromise = null;
+      reject(new Error("Failed to load WebTorrent from CDN"));
+    };
+    document.head.appendChild(script);
+  });
+
+  return wtLoadPromise;
 }
 
 export function TorrentPlayer({
@@ -95,8 +137,7 @@ export function TorrentPlayer({
   isHost,
 }: TorrentPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const torrentRef = useRef<any>(null);
   const seedingRef = useRef<any>(null);
 
@@ -148,10 +189,28 @@ export function TorrentPlayer({
         const videoEl = videoRef.current;
         if (videoEl) {
           const fileObj = torrent.files[0];
-          fileObj.streamTo(videoEl).then(() => {
-            setReady(true);
-            setDuration(videoEl.duration || 0);
-          });
+          if (fileObj) {
+            if (typeof fileObj.renderTo === "function") {
+              fileObj.renderTo(videoEl, (err: any) => {
+                if (!err) {
+                  setReady(true);
+                  setDuration(videoEl.duration || 0);
+                }
+              });
+            } else if (typeof fileObj.streamTo === "function") {
+              fileObj.streamTo(videoEl).then(() => {
+                setReady(true);
+                setDuration(videoEl.duration || 0);
+              });
+            } else {
+              fileObj.getBlobURL((err: any, url: string) => {
+                if (!err && url) {
+                  videoEl.src = url;
+                  setReady(true);
+                }
+              });
+            }
+          }
         }
       });
     } catch (e) {
@@ -171,23 +230,45 @@ export function TorrentPlayer({
 
     loadWebTorrent().then((client) => {
       if (cancelled) return;
-      setStatus("Connecting to host…");
+      setStatus("Connecting to peers…");
 
       // Add the torrent
       const torrent = client.add(magnetURI, (t: any) => {
         if (cancelled) return;
-        setStatus("Downloading from host…");
+        setStatus("Downloading media stream…");
         const videoEl = videoRef.current;
         if (!videoEl) return;
 
         // Stream the first file to the video element
         const file = t.files[0];
-        file.streamTo(videoEl).then(() => {
-          if (cancelled) return;
-          setReady(true);
-          setDuration(videoEl.duration || 0);
-          setStatus(`Streaming — ${t.numPeers} peer(s)`);
-        });
+        if (file) {
+          if (typeof file.renderTo === "function") {
+            file.renderTo(videoEl, (err: any) => {
+              if (cancelled) return;
+              if (!err) {
+                setReady(true);
+                setDuration(videoEl.duration || 0);
+                setStatus(`Streaming — ${t.numPeers} peer(s)`);
+              }
+            });
+          } else if (typeof file.streamTo === "function") {
+            file.streamTo(videoEl).then(() => {
+              if (cancelled) return;
+              setReady(true);
+              setDuration(videoEl.duration || 0);
+              setStatus(`Streaming — ${t.numPeers} peer(s)`);
+            });
+          } else {
+            file.getBlobURL((err: any, url: string) => {
+              if (cancelled) return;
+              if (!err && url) {
+                videoEl.src = url;
+                setReady(true);
+                setStatus(`Streaming — ${t.numPeers} peer(s)`);
+              }
+            });
+          }
+        }
       });
 
       torrentRef.current = torrent;
@@ -235,7 +316,7 @@ export function TorrentPlayer({
       v.removeEventListener("durationchange", onDur);
       v.removeEventListener("loadedmetadata", onDur);
     };
-  }, [videoRef.current]);
+  }, []);
 
   // ── Fullscreen ──
   useEffect(() => {
@@ -249,14 +330,14 @@ export function TorrentPlayer({
     if (!v) return;
     if (v.paused) v.play().catch(() => { v.muted = true; v.play().catch(() => {}); });
     else v.pause();
-  }, [videoRef]);
+  }, []);
 
   const toggleMute = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
     v.muted = !v.muted;
     setMuted(v.muted);
-  }, [videoRef]);
+  }, []);
 
   const onVolumeChange = useCallback((val: number[]) => {
     const vol = val[0] ?? 1;
@@ -272,132 +353,148 @@ export function TorrentPlayer({
   const onSeek = useCallback((val: number[]) => {
     const t = val[0];
     const v = videoRef.current;
-    if (v) {
+    if (v && Number.isFinite(t)) {
       v.currentTime = t;
-      setLocalTime(t);
+      cmdSeek?.(t);
     }
-    onIntent({ currentTime: t });
-  }, [videoRef, onIntent]);
+  }, [cmdSeek]);
 
   const toggleFullscreen = useCallback(() => {
+    if (!containerRef.current) return;
     if (!document.fullscreenElement) {
-      wrapRef.current?.requestFullscreen?.().catch(() => {});
+      containerRef.current.requestFullscreen().catch(() => {});
     } else {
-      document.exitFullscreen?.().catch(() => {});
+      document.exitFullscreen().catch(() => {});
     }
   }, []);
 
-  // ── No video yet: anyone can pick a file to seed ──
-  if (!isMagnet) {
-    return (
-      <div className="flex h-full w-full items-center justify-center bg-black p-6">
-        <div className="max-w-md text-center">
-          <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-violet-500/10">
-            <Upload className="h-7 w-7 text-violet-400" />
-          </div>
-          <p className="text-sm font-semibold text-white">
-            Pick a movie to stream to everyone
-          </p>
-          <p className="mt-1.5 text-xs text-white/50">
-            Pick a video file from your device and it&apos;ll stream directly
-            to all viewers via WebTorrent (P2P). Only one person needs the file.
-          </p>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/*"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) handleFilePick(f);
-            }}
-          />
-          <Button
-            className="mt-4 gap-2"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Upload className="h-4 w-4" /> Choose movie file
-          </Button>
-          <p className="mt-3 text-[10px] text-white/30">
-            Supports MP4, WebM, MKV — anything your browser can play.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div
-      ref={wrapRef}
-      className="group relative h-full w-full overflow-hidden bg-black"
+      ref={containerRef}
+      className="group relative flex h-full w-full items-center justify-center bg-black overflow-hidden select-none"
     >
-      <video
-        ref={videoRef}
-        className="absolute inset-0 h-full w-full bg-black object-contain"
-        playsInline
-        onClick={togglePlay}
-        onDoubleClick={toggleFullscreen}
-        style={{ objectFit: "contain" }}
-      />
+      {/* ── Strict 16:9 widescreen stage container ── */}
+      <div className="relative w-full h-full max-w-[calc(100vh*16/9)] max-h-[calc(100vw*9/16)] aspect-video flex items-center justify-center bg-black">
+        {/* Hidden video element that WebTorrent streams into */}
+        <video
+          ref={videoRef}
+          playsInline
+          className={`h-full w-full object-contain ${ready ? "block" : "hidden"}`}
+        />
 
-      {/* Loading / status overlay */}
-      {!ready && !error && (
-        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center bg-black/60">
-          <Loader2 className="h-10 w-10 animate-spin text-violet-400" />
-          <p className="mt-3 text-sm text-white/80">{status}</p>
-          {progress > 0 && progress < 100 && (
-            <div className="mt-2 w-48 rounded-full bg-white/10">
-              <div
-                className="h-1.5 rounded-full bg-violet-500 transition-all"
-                style={{ width: `${progress}%` }}
+        {/* Not playing yet: Host file picker or Viewer waiting screen */}
+        {!ready && (
+          <div className="flex h-full w-full flex-col items-center justify-center p-6 text-center">
+            {isHost ? (
+              <div className="max-w-md space-y-4">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 shadow-lg shadow-emerald-500/20 text-white">
+                  <Globe className="h-8 w-8" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">WebTorrent P2P Stream</h3>
+                  <p className="mt-1 text-xs text-zinc-400">
+                    Seed any video file directly to room members over peer-to-peer WebTorrent swarms. No server storage needed.
+                  </p>
+                </div>
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-xs font-semibold text-zinc-950 shadow hover:bg-emerald-400 transition-colors">
+                  <Upload className="h-4 w-4" /> Pick Video to Seed
+                  <input
+                    type="file"
+                    accept="video/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleFilePick(f);
+                    }}
+                  />
+                </label>
+                {status && (
+                  <div className="flex items-center justify-center gap-2 text-xs text-emerald-400">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>{status}</span>
+                  </div>
+                )}
+                {error && (
+                  <div className="flex items-center justify-center gap-2 text-xs text-rose-400">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    <span>{error}</span>
+                  </div>
+                )}
+              </div>
+            ) : isMagnet ? (
+              <div className="max-w-md space-y-4">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 shadow-lg shadow-emerald-500/20 text-white animate-pulse">
+                  <Globe className="h-8 w-8" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">Connecting to Torrent Swarm</h3>
+                  <p className="mt-1 text-xs text-zinc-400">
+                    Downloading video stream directly from host and connected peers.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                    <span>{status || "Connecting…"}</span>
+                    <span>{Math.round(progress)}%</span>
+                  </div>
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                    <div
+                      className="h-full bg-emerald-500 transition-all duration-300"
+                      style={{ width: `${progress}%` }}
+                    />
+                  </div>
+                </div>
+                {error && (
+                  <div className="flex items-center justify-center gap-2 text-xs text-rose-400">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    <span>{error}</span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="max-w-md space-y-4">
+                <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-zinc-800 text-zinc-400">
+                  <Globe className="h-8 w-8" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">No Torrent Active</h3>
+                  <p className="mt-1 text-xs text-zinc-400">
+                    Waiting for the host to start seeding a movie via WebTorrent…
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── Overlay Badges ── */}
+      {ready && (
+        <div className="absolute top-3 left-3 z-20 flex items-center gap-2 pointer-events-none">
+          <span className="flex items-center gap-1.5 rounded-full bg-emerald-500/20 border border-emerald-500/40 px-2.5 py-1 text-[11px] font-semibold text-emerald-400 backdrop-blur">
+            <Globe className="h-3 w-3" /> WebTorrent P2P
+          </span>
+          <span className="flex items-center gap-1 rounded-full bg-black/60 px-2.5 py-1 text-[11px] text-zinc-300 backdrop-blur">
+            <Users className="h-3 w-3" /> {peers} peer(s)
+          </span>
+        </div>
+      )}
+
+      {/* ── Controls Bar ── */}
+      {ready && (
+        <div className="absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/90 via-black/50 to-transparent p-4 opacity-0 transition-opacity group-hover:opacity-100">
+          <div className="mb-2 flex items-center gap-3">
+            <div className="flex-1">
+              <Slider
+                value={[localTime]}
+                min={0}
+                max={duration || 100}
+                step={0.1}
+                onValueChange={onSeek}
               />
             </div>
-          )}
-        </div>
-      )}
-
-      {/* Error overlay */}
-      {error && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80 p-6">
-          <div className="max-w-md text-center">
-            <AlertCircle className="mx-auto mb-3 h-10 w-10 text-rose-400" />
-            <p className="text-sm font-medium text-white">Streaming error</p>
-            <p className="mt-1 text-xs text-white/60">{error}</p>
-          </div>
-        </div>
-      )}
-
-      {/* Status bar (top) */}
-      {ready && (
-        <div className="absolute left-3 top-3 flex items-center gap-2">
-          <Badge variant="secondary" className="gap-1 bg-black/60 text-white backdrop-blur">
-            <Wifi className="h-3 w-3" /> {peers} peer{peers !== 1 ? "s" : ""}
-          </Badge>
-          {progress < 100 && (
-            <Badge variant="secondary" className="gap-1 bg-black/60 text-white backdrop-blur">
-              {Math.round(progress)}% buffered
-            </Badge>
-          )}
-        </div>
-      )}
-
-      {/* Controls (bottom) */}
-      {ready && (
-        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-3 pt-8">
-          <div className="mb-2 flex items-center gap-2">
-            <span className="text-xs tabular-nums text-white/80">
-              {fmtTime(localTime)}
-            </span>
-            <Slider
-              value={[localTime]}
-              min={0}
-              max={duration || 100}
-              step={0.1}
-              onValueChange={onSeek}
-              className="flex-1"
-            />
-            <span className="text-xs tabular-nums text-white/80">
-              {fmtTime(duration)}
+            <span className="font-mono text-xs text-white/80">
+              {fmtTime(localTime)} / {fmtTime(duration)}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -436,7 +533,8 @@ function fmtTime(s: number): string {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = Math.floor(s % 60);
-  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
-  const ss = String(sec).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  }
+  return `${m}:${sec.toString().padStart(2, "0")}`;
 }

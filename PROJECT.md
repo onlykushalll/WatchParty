@@ -30,13 +30,13 @@ WatchParty is a real-time collaborative watch party platform consisting of:
 | 16 | Production Build & Git Cleanliness | Next.js production build (`bun run build`), clean tree, push to origin/main | M5 | Survey 3 |
 
 ## Milestones
-| # | Name | Scope | Dependencies | Status |
-|---|------|-------|-------------|--------|
-| M1 | State Sync Engine Hardening | `mini-services/sync-service/`, `src/lib/sync/`, `src/lib/webrtc/`, `extension/` | none | IN_PROGRESS |
-| M2 | VM Co-Browsing Hardening | `vm-service/`, `src/components/watchparty/virtual-browser.tsx` | none | PLANNED |
-| M3 | UI Players & Light Theme Default | `src/app/layout.tsx`, `src/components/watchparty/` | M1, M2 | PLANNED |
-| M4 | Comprehensive & Adversarial Tests | `src/__tests__/`, `src/lib/sync/__tests__/` | M1, M2, M3 | PLANNED |
-| M5 | Production Build & Git Push | Production build, git commit & push to origin/main | M4 | PLANNED |
+| # | Name | Scope | Dependencies | Status | Key Outputs |
+|---|------|-------|-------------|--------|-------------|
+| M1 | State Sync Engine Hardening | `mini-services/sync-service/`, `src/lib/sync/`, `src/lib/webrtc/`, `extension/` | none | DONE | `ClockSyncEstimator`, `PISlewingController`, targeted WebRTC signaling, buffer recovery |
+| M2 | VM Co-Browsing Hardening | `vm-service/`, `src/components/watchparty/virtual-browser.tsx` | none | DONE | Opcode 16/17 handshake, Opcode 12 nav push, coordinate clamping, URL sanitization |
+| M3 | UI Players & Light Theme Default | `src/app/layout.tsx`, `src/components/watchparty/` | M1, M2 | DONE | Default Porcelain light theme, UniversalPlayer, CineVoPanel, StreamPlayer, TorrentPlayer, SidePanel |
+| M4 | Comprehensive & Adversarial Tests | `src/__tests__/`, `src/lib/sync/__tests__/` | M1, M2, M3 | DONE | 120/120 passing tests, 2,136 assertions across 7 test suites |
+| M5 | Production Build & Git Push | Production build, git commit & push to origin/main | M4 | DONE | Next.js Turbopack build exit code 0, Git clean and pushed to `origin/main` |
 
 ## Interface Contracts
 ### Client Sync Hook ↔ Sync Service (`Socket.IO :3003`)
