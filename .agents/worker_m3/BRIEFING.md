@@ -1,4 +1,4 @@
-# BRIEFING — 2026-08-17T09:21:32Z
+# BRIEFING — 2026-08-17T09:27:00Z
 
 ## Mission
 Complete Milestone 3: Client Player Stage, UI Components & Light Theme Default. Ensure Porcelain Light theme default, full fidelity and polish across all player modalities and side panel components, clean build and passing tests.
@@ -24,32 +24,36 @@ Complete Milestone 3: Client Player Stage, UI Components & Light Theme Default. 
 - Updated: not yet
 
 ## Task Summary
-- **What to build/polish**:
-  1. Default to Light Theme (remove hardcoded `dark` in layout.tsx, verify globals.css theme variables and theme toggling).
-  2. Verify & Polish UniversalPlayer, VirtualBrowser, CineVoPanel, StreamPlayer, TorrentPlayer.
-  3. Verify & Polish ChatPanel (WhatsApp-styled bubbles, double-check delivery ticks, reactions, system alerts), QueuePanel (playlist queue, reordering, adding items, autoplay next), CallsPanel (WebRTC voice/video with Standard, Incognito/Masked, Push-to-Talk modes), and SidePanel.
-  4. Run `bun test` and `bun run build` to verify clean pass.
-- **Success criteria**:
-  * Default Porcelain Light theme loads when no theme preference is set.
-  * All modalities function reliably with real state and sync handling.
-  * Side panel components meet all UI/UX and feature requirements.
-  * `bun test` and `bun run build` succeed with 0 errors.
+- **What was completed**:
+  1. Default Light Theme: Removed hardcoded `className="dark"` in `src/app/layout.tsx` so that root HTML renders Porcelain Light theme default (:root CSS variables in `globals.css`). Added `@utility no-scrollbar` to `globals.css`.
+  2. Player Modalities: Verified & polished UniversalPlayer, VirtualBrowser (Opcode 1 screencast, Opcode 12 CDP navigation, Opcode 128/129/18 floor state), CineVoPanel (MV3 extension status, connect bridge, room code), StreamPlayer (WebRTC P2P stream host/viewer), TorrentPlayer (WebTorrent dynamic runtime client).
+  3. SidePanel Components: Verified & polished ChatPanel (WhatsApp styling, double blue checks, emoji reactions, Sonner toast system alerts), QueuePanel (playlist queue, item adding, reordering up/down, autoplay next toggle), CallsPanel (Standard, Incognito Avatar/Blur/Blackout, and Push-to-Talk modes), and SidePanel composite component.
+  4. Verified full test suite (`bun test` passes 74/74) and production build (`bun run build` succeeds cleanly).
 
 ## Key Decisions Made
-- [TBD]
+- Modularized `CineVoPanel` and `SidePanel` into dedicated component files in `src/components/watchparty/` for clean reusability across pages and views.
+- Implemented Push-to-Talk (PTT) with Spacebar keyboard listener and touch/mouse hold triggers in `CallsPanel`.
+- Preserved backward compatibility across all player and sidepanel component prop signatures.
 
 ## Change Tracker
-- **Files modified**: [TBD]
-- **Build status**: [TBD]
+- **Files modified/created**:
+  * `src/app/layout.tsx` — removed hardcoded dark class from html tag
+  * `src/app/globals.css` — added no-scrollbar utility class
+  * `src/components/watchparty/cinevo-panel.tsx` — modularized CineVo panel component
+  * `src/components/watchparty/side-panel.tsx` — composite SidePanel component with tabs & badges
+  * `src/components/watchparty/virtual-browser.tsx` — added Opcode 129 and Opcode 18 floor state broadcast handling
+  * `src/components/watchparty/queue-panel.tsx` — added add-to-queue form, reordering buttons, autoplay toggle
+  * `src/components/watchparty/calls-panel.tsx` — added Standard, Incognito, and Push-to-Talk privacy modes
+- **Build status**: PASS (Next.js 16.3.0 production build)
 - **Pending issues**: None
 
 ## Quality Status
-- **Build/test result**: [TBD]
+- **Build/test result**: PASS (74/74 tests passing, 1680 assertions, exit code 0)
 - **Lint status**: Clean
-- **Tests added/modified**: [TBD]
+- **Tests added/modified**: 0 regressions
 
 ## Loaded Skills
-- None required directly beyond built-in capabilities.
+- Built-in capabilities
 
 ## Artifact Index
 - `.agents/worker_m3/DISPATCH.md` — Assignment instructions

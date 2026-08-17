@@ -25,6 +25,17 @@ describe("Empirical Challenge 1: Late-Joiner Playhead Calculation Formula", () =
       expect(result).toBeCloseTo(tc.expected, 4);
     }
   });
+
+  test("handles multi-hour timestamps without integer overflow or precision loss", () => {
+    // 3 hours = 10,800 seconds in video timeline
+    const base = 10800.0;
+    const lastSync = 1700000000000;
+    const clientNow = 1700000060000; // 60 seconds later
+    const theta = -150;
+    const result = computeExpectedPlayhead(base, lastSync, clientNow, theta, 1.0, true);
+    // 60000 - 150 = 59850ms = 59.85s -> 10800 + 59.85 = 10859.85s
+    expect(result).toBeCloseTo(10859.85, 3);
+  });
 });
 
 describe("Empirical Challenge 2: Late-Joiner Direct Seek Behavior", () => {
@@ -56,6 +67,20 @@ describe("Empirical Challenge 2: Late-Joiner Direct Seek Behavior", () => {
     expect(output.action).toBe("SEEK");
     expect(output.errorSec).toBeCloseTo(619.8, 3);
     // PI integral must remain clean (0) after direct seek
+    expect(pi.getIntegral()).toBe(0);
+  });
+
+  test("recovers from SEEK to deadband tracking once seek lands within 100ms", () => {
+    const pi = new PISlewingController();
+
+    // 1. Desync of 5.0s -> SEEK
+    const s1 = pi.compute(105.0, 100.0, 0.5, 1.0);
+    expect(s1.action).toBe("SEEK");
+
+    // 2. Video player executes seek, now actual is 104.95s (error = 50ms <= 100ms deadband)
+    const s2 = pi.compute(105.0, 104.95, 0.1, 1.0);
+    expect(s2.action).toBe("NONE");
+    expect(s2.slewRate).toBe(1.0);
     expect(pi.getIntegral()).toBe(0);
   });
 });
@@ -104,5 +129,59 @@ describe("Empirical Challenge 3: YouTube setPlaybackRate & Rate Bounds Compatibi
     // Integral should be capped / frozen by anti-windup guard
     const maxIntegral = pi.getIntegral();
     expect(maxIntegral).toBeLessThan(10.0); // Without anti-windup, 100 * 0.9 * 0.5 would be 45
+  });
+});
+
+describe("Empirical Challenge 4: Clock Drift & Network Jitter Simulation", () => {
+  test("tracks linear clock drift over 60 iterations with periodic NTP probes", () => {
+    const sync = new ClockSyncEstimator({ windowSize: 8, maxRttThresholdMs: 500, alpha: 0.2 });
+
+    // Simulate clock drift: client clock runs faster by +2ms every second
+    // Initial true offset: +50ms
+    let trueOffset = 50;
+    const baseTime = 100000;
+
+    for (let sec = 0; sec < 60; sec++) {
+      trueOffset += 2; // +2ms per second drift
+      const t0 = baseTime + sec * 1000;
+      const oneWayDelay = 15; // 15ms one-way delay (30ms RTT)
+      const t1 = t0 + trueOffset + oneWayDelay;
+      const t2 = t1 + 2; // 2ms server processing
+      const t3 = t0 + 2 * oneWayDelay + 2;
+
+      sync.processProbe(t0, t1, t2, t3);
+    }
+
+    // After 60 seconds, true offset is 50 + 120 = 170ms
+    // The EMA smoothed estimated offset (with alpha=0.2 and window=8) tracks the true offset with ~22ms mathematical lag (approx 148ms)
+    expect(sync.getOffset()).toBeGreaterThan(140);
+    expect(sync.getOffset()).toBeLessThan(175);
+  });
+
+  test("maintains stable offset estimate under 90% jitter and random 10% packet bursts", () => {
+    const sync = new ClockSyncEstimator({ windowSize: 8, maxRttThresholdMs: 500, alpha: 0.2 });
+    const trueOffset = 100; // True offset is +100ms
+
+    // Seeded pseudo-random sequence
+    let seed = 42;
+    const pseudoRand = () => {
+      seed = (seed * 9301 + 49297) % 233280;
+      return seed / 233280;
+    };
+
+    for (let i = 0; i < 100; i++) {
+      const t0 = i * 2000;
+      const isSpike = pseudoRand() < 0.15; // 15% spikes
+      const rtt = isSpike ? 600 + pseudoRand() * 500 : 20 + pseudoRand() * 60; // Spikes: 600-1100ms, Normal: 20-80ms
+      const oneWay = rtt / 2;
+      const t1 = t0 + trueOffset + oneWay;
+      const t2 = t1;
+      const t3 = t0 + rtt;
+
+      sync.processProbe(t0, t1, t2, t3);
+    }
+
+    // Estimated offset must converge near +100ms and not be thrown off by spikes > 500ms
+    expect(sync.getOffset()).toBeCloseTo(100, 0);
   });
 });

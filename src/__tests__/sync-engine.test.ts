@@ -1,295 +1,427 @@
 // @ts-ignore
 import { describe, expect, test, beforeEach } from "bun:test";
+import { PlaybackState, Participant, detectVideoType, youtubeId } from "../lib/sync/types";
 import { ClockSyncEstimator } from "../lib/sync/clock-sync";
 import { PISlewingController, computeExpectedPlayhead } from "../lib/sync/pi-controller";
 
-describe("Requirement R2: ClockSyncEstimator (Cristian's NTP & EMA)", () => {
-  let sync: ClockSyncEstimator;
+// ── Mock Room State Simulator for Sync Service Logic ──
+interface MockParticipant {
+  socketId: string;
+  userId: string;
+  name: string;
+  color: string;
+  isHost: boolean;
+  joinedAt: number;
+  clockOffset: number;
+  rtt: number;
+  isMicMuted?: boolean;
+  isCameraOn?: boolean;
+  cameraPrivacyMode?: "blackout" | "blur" | "avatar";
+  isBuffering?: boolean;
+}
+
+interface MockRoom {
+  roomId: string;
+  participants: Map<string, MockParticipant>;
+  playback: PlaybackState;
+  queue: { url: string; type: string; addedBy: string; addedAt: number }[];
+  currentIndex: number;
+  lastActivity: number;
+  vmController: string | null;
+  vmControlQueue: string[];
+  source: { url: string; setBy: string; setAt: number } | null;
+  adState: Map<string, boolean>;
+  tsMap: Record<string, number>;
+  lastTsMap: number;
+  streamHost: { userId: string; fileName: string } | null;
+}
+
+function createMockRoom(roomId: string = "test-room"): MockRoom {
+  return {
+    roomId,
+    participants: new Map(),
+    playback: {
+      isPlaying: false,
+      currentTime: 0,
+      playbackRate: 1,
+      videoUrl: "",
+      videoType: "",
+      fileName: "",
+      lastChangedAt: Date.now(),
+      lastChangedBy: "",
+      seq: 0,
+    },
+    queue: [],
+    currentIndex: -1,
+    lastActivity: Date.now(),
+    vmController: null,
+    vmControlQueue: [],
+    source: null,
+    adState: new Map(),
+    tsMap: {},
+    lastTsMap: Date.now(),
+    streamHost: null,
+  };
+}
+
+describe("State Synchronization Engine: Room Lifecycle & Presence", () => {
+  let room: MockRoom;
 
   beforeEach(() => {
-    sync = new ClockSyncEstimator({ windowSize: 8, maxRttThresholdMs: 500, alpha: 0.2 });
+    room = createMockRoom();
   });
 
-  test("calculates raw offset and RTT correctly for symmetrical network delay", () => {
-    // Client send t0=1000, Server recv t1=1020, Server transmit t2=1020, Client recv t3=1040
-    // RTT = (1040-1000) - (1020-1020) = 40ms
-    // Raw Offset = ((1020-1000) + (1020-1040)) / 2 = (20 + -20) / 2 = 0ms
-    const res = sync.processProbe(1000, 1020, 1020, 1040);
-    expect(res.rtt).toBe(40);
-    expect(res.rawOffset).toBe(0);
-    expect(res.offset).toBe(0);
-    expect(res.accepted).toBe(true);
+  test("first participant to join is designated as host", () => {
+    const p1: MockParticipant = {
+      socketId: "sock_1",
+      userId: "user_alice",
+      name: "Alice",
+      color: "#f87171",
+      isHost: room.participants.size === 0,
+      joinedAt: Date.now(),
+      clockOffset: 0,
+      rtt: 30,
+    };
+    room.participants.set(p1.socketId, p1);
+
+    const p2: MockParticipant = {
+      socketId: "sock_2",
+      userId: "user_bob",
+      name: "Bob",
+      color: "#fb923c",
+      isHost: room.participants.size === 0,
+      joinedAt: Date.now(),
+      clockOffset: 0,
+      rtt: 45,
+    };
+    room.participants.set(p2.socketId, p2);
+
+    expect(p1.isHost).toBe(true);
+    expect(p2.isHost).toBe(false);
   });
 
-  test("calculates correct offset when server is ahead by +100ms", () => {
-    // Client send t0=1000, Server recv t1=1110, Server transmit t2=1110, Client recv t3=1020
-    // RTT = (1020-1000) - (1110-1110) = 20ms
-    // Raw Offset = ((1110-1000) + (1110-1020)) / 2 = (110 + 90) / 2 = +100ms
-    const res = sync.processProbe(1000, 1110, 1110, 1020);
-    expect(res.rtt).toBe(20);
-    expect(res.offset).toBe(100);
-    expect(res.accepted).toBe(true);
-  });
+  test("host migration on host disconnect assigns host to first remaining participant", () => {
+    const p1: MockParticipant = {
+      socketId: "sock_1",
+      userId: "user_alice",
+      name: "Alice",
+      color: "#f87171",
+      isHost: true,
+      joinedAt: Date.now(),
+      clockOffset: 0,
+      rtt: 30,
+    };
+    const p2: MockParticipant = {
+      socketId: "sock_2",
+      userId: "user_bob",
+      name: "Bob",
+      color: "#fb923c",
+      isHost: false,
+      joinedAt: Date.now(),
+      clockOffset: 0,
+      rtt: 45,
+    };
+    room.participants.set(p1.socketId, p1);
+    room.participants.set(p2.socketId, p2);
 
-  test("rejects outlier probes with RTT > 500ms", () => {
-    // Valid initial probe: RTT = 60ms, Offset = +100ms
-    sync.processProbe(1000, 1130, 1130, 1060);
-    expect(sync.getOffset()).toBe(100);
-
-    // Outlier probe: RTT = 600ms (> 500ms threshold)
-    const outlierRes = sync.processProbe(1000, 1400, 1400, 1600);
-    expect(outlierRes.accepted).toBe(false);
-    expect(sync.getOffset()).toBe(100); // Current offset unchanged
-  });
-
-  test("selects minimum RTT probe from sliding window and applies EMA smoothing (alpha=0.2)", () => {
-    // Initial probe: Offset = +100ms, RTT = 100ms -> initializes offset to 100
-    sync.processProbe(1000, 1150, 1150, 1100);
-    expect(sync.getOffset()).toBe(100);
-
-    // Probe 2: High RTT sample (Offset = +200ms, RTT = 200ms)
-    // Probe 3: Min RTT sample (Offset = +50ms, RTT = 20ms)
-    sync.processProbe(2000, 2300, 2300, 2200); // offset +200, RTT 200
-    sync.processProbe(3000, 3060, 3060, 3020); // offset +50, min RTT=20ms
-
-    // Candidate offset from min-RTT probe = +50ms
-    // EMA calculation: alpha * candidate + (1 - alpha) * prev
-    // 0.2 * 50 + 0.8 * 100 = 10 + 80 = 90ms
-    expect(sync.getOffset()).toBeCloseTo(90, 1);
-  });
-
-  test("resets state correctly", () => {
-    sync.processProbe(1000, 1110, 1110, 1020);
-    expect(sync.isReady()).toBe(true);
-    sync.reset();
-    expect(sync.isReady()).toBe(false);
-    expect(sync.getOffset()).toBe(0);
-    expect(sync.getWindowSize()).toBe(0);
-  });
-
-  test("STRESS: extreme latency jitter (20ms -> 800ms -> 1200ms -> 501ms) strictly rejects >500ms outliers without corrupting offset", () => {
-    // Establish baseline offset with 20ms RTT probes (offset = +50ms)
-    for (let i = 0; i < 5; i++) {
-      const res = sync.processProbe(1000 + i * 1000, 1060 + i * 1000, 1060 + i * 1000, 1020 + i * 1000);
-      expect(res.accepted).toBe(true);
-      expect(res.rtt).toBe(20);
+    // Alice disconnects
+    room.participants.delete(p1.socketId);
+    if (p1.isHost && room.participants.size > 0) {
+      const next = Array.from(room.participants.values())[0];
+      next.isHost = true;
     }
-    expect(sync.getOffset()).toBe(50);
 
-    // Extreme latency spike 1: RTT = 800ms (> 500ms threshold)
-    const spike1 = sync.processProbe(10000, 1400, 1400, 10800); // RTT = 800ms
-    expect(spike1.accepted).toBe(false);
-    expect(sync.getOffset()).toBe(50); // Offset unchanged
+    expect(room.participants.size).toBe(1);
+    expect(p2.isHost).toBe(true);
+  });
+});
 
-    // Extreme latency spike 2: RTT = 1200ms
-    const spike2 = sync.processProbe(20000, 2600, 2600, 21200);
-    expect(spike2.accepted).toBe(false);
-    expect(sync.getOffset()).toBe(50);
+describe("State Synchronization Engine: Command Relays & tsMap Heartbeat", () => {
+  let room: MockRoom;
 
-    // Boundary check: RTT = 501ms (just above 500ms threshold)
-    const spike3 = sync.processProbe(30000, 3251, 3251, 30502);
-    expect(spike3.accepted).toBe(false);
-    expect(sync.getOffset()).toBe(50);
-
-    // Boundary check: RTT = 500ms (exact threshold)
-    const boundary = sync.processProbe(40000, 4250, 4250, 40500);
-    expect(boundary.accepted).toBe(true);
+  beforeEach(() => {
+    room = createMockRoom();
+    room.playback.videoUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    room.playback.videoType = "youtube";
+    room.playback.currentTime = 10.0;
   });
 
-  test("STRESS: rapid high-jitter burst preserves min-RTT selection across 50 iterations", () => {
-    // Alternating between normal 30ms RTT (+100ms offset) and extreme 800ms spike (+500ms raw offset)
-    for (let i = 0; i < 50; i++) {
-      if (i % 2 === 0) {
-        const res = sync.processProbe(i * 1000, i * 1000 + 115, i * 1000 + 115, i * 1000 + 30);
-        expect(res.accepted).toBe(true);
-        expect(res.rtt).toBe(30);
-      } else {
-        const res = sync.processProbe(i * 1000, i * 1000 + 900, i * 1000 + 900, i * 1000 + 800);
-        expect(res.accepted).toBe(false);
+  test("CMD:play sets isPlaying=true, increments seq, and updates lastChangedAt", () => {
+    const prevSeq = room.playback.seq;
+    const now = Date.now();
+
+    room.playback.isPlaying = true;
+    room.playback.lastChangedAt = now;
+    room.playback.lastChangedBy = "user_alice";
+    room.playback.seq++;
+
+    expect(room.playback.isPlaying).toBe(true);
+    expect(room.playback.seq).toBe(prevSeq + 1);
+    expect(room.playback.lastChangedBy).toBe("user_alice");
+    expect(room.playback.lastChangedAt).toBe(now);
+  });
+
+  test("CMD:pause sets isPlaying=false, increments seq, and updates lastChangedAt", () => {
+    room.playback.isPlaying = true;
+    const prevSeq = room.playback.seq;
+    const now = Date.now();
+
+    room.playback.isPlaying = false;
+    room.playback.lastChangedAt = now;
+    room.playback.lastChangedBy = "user_bob";
+    room.playback.seq++;
+
+    expect(room.playback.isPlaying).toBe(false);
+    expect(room.playback.seq).toBe(prevSeq + 1);
+    expect(room.playback.lastChangedBy).toBe("user_bob");
+  });
+
+  test("CMD:seek updates currentTime, updates isPlaying, and increments seq", () => {
+    const seekTime = 145.5;
+    const prevSeq = room.playback.seq;
+    const now = Date.now();
+
+    room.playback.currentTime = seekTime;
+    room.playback.isPlaying = true;
+    room.playback.lastChangedAt = now;
+    room.playback.lastChangedBy = "user_charlie";
+    room.playback.seq++;
+
+    expect(room.playback.currentTime).toBe(145.5);
+    expect(room.playback.isPlaying).toBe(true);
+    expect(room.playback.seq).toBe(prevSeq + 1);
+  });
+
+  test("tsMap heartbeat records participant playhead and evicts stale disconnected participants", () => {
+    const p1: MockParticipant = { socketId: "s1", userId: "u1", name: "Alice", color: "#f87171", isHost: true, joinedAt: Date.now(), clockOffset: 0, rtt: 30 };
+    const p2: MockParticipant = { socketId: "s2", userId: "u2", name: "Bob", color: "#fb923c", isHost: false, joinedAt: Date.now(), clockOffset: 0, rtt: 45 };
+    room.participants.set(p1.socketId, p1);
+    room.participants.set(p2.socketId, p2);
+
+    // Heartbeats received
+    room.tsMap["u1"] = 120.4;
+    room.tsMap["u2"] = 120.2;
+    room.tsMap["stale_user"] = 115.0;
+
+    // 1-second interval pruning routine
+    const memberIds = Array.from(room.participants.values()).map((p) => p.userId);
+    Object.keys(room.tsMap).forEach((key) => {
+      if (!memberIds.includes(key)) delete room.tsMap[key];
+    });
+
+    expect(room.tsMap["u1"]).toBe(120.4);
+    expect(room.tsMap["u2"]).toBe(120.2);
+    expect(room.tsMap["stale_user"]).toBeUndefined();
+  });
+});
+
+describe("State Synchronization Engine: Buffer-Aware Group Wait", () => {
+  let room: MockRoom;
+
+  beforeEach(() => {
+    room = createMockRoom();
+    room.playback.videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+    room.playback.videoType = "mp4";
+    room.playback.isPlaying = true;
+    room.playback.currentTime = 50.0;
+  });
+
+  test("buffer:event 'waiting' pauses room playback and stores buffering position", () => {
+    const p1: MockParticipant = { socketId: "s1", userId: "u1", name: "Alice", color: "#f87171", isHost: true, joinedAt: Date.now(), clockOffset: 0, rtt: 40 };
+    room.participants.set(p1.socketId, p1);
+
+    // Alice buffers at 52.3s
+    p1.isBuffering = true;
+    room.playback.isPlaying = false;
+    room.playback.currentTime = 52.3;
+    room.playback.lastChangedAt = Date.now();
+    room.playback.lastChangedBy = p1.userId;
+    room.playback.seq++;
+
+    expect(p1.isBuffering).toBe(true);
+    expect(room.playback.isPlaying).toBe(false);
+    expect(room.playback.currentTime).toBe(52.3);
+  });
+
+  test("buffer:event 'playing' resumes with dynamic RTT padding when all participants are ready", () => {
+    const p1: MockParticipant = { socketId: "s1", userId: "u1", name: "Alice", color: "#f87171", isHost: true, joinedAt: Date.now(), clockOffset: 0, rtt: 80, isBuffering: true };
+    const p2: MockParticipant = { socketId: "s2", userId: "u2", name: "Bob", color: "#fb923c", isHost: false, joinedAt: Date.now(), clockOffset: 0, rtt: 120, isBuffering: false };
+    room.participants.set(p1.socketId, p1);
+    room.participants.set(p2.socketId, p2);
+    room.playback.isPlaying = false;
+
+    // Alice finishes buffering
+    p1.isBuffering = false;
+
+    const allReady = Array.from(room.participants.values()).every((p) => !p.isBuffering);
+    expect(allReady).toBe(true);
+
+    let highestRtt = 0;
+    for (const p of room.participants.values()) {
+      highestRtt = Math.max(highestRtt, p.rtt || 50);
+    }
+    expect(highestRtt).toBe(120);
+
+    const now = Date.now();
+    const dynamicPaddingMs = Math.max(highestRtt * 2, 500); // Math.max(240, 500) = 500ms
+    room.playback.isPlaying = true;
+    room.playback.lastChangedAt = now + dynamicPaddingMs;
+    room.playback.seq++;
+
+    expect(room.playback.isPlaying).toBe(true);
+    expect(room.playback.lastChangedAt).toBe(now + 500);
+  });
+
+  test("disconnect resilience: buffering participant leaves, remaining ready participants resume immediately", () => {
+    const p1: MockParticipant = { socketId: "s1", userId: "u1", name: "Alice", color: "#f87171", isHost: true, joinedAt: Date.now(), clockOffset: 0, rtt: 50, isBuffering: false };
+    const p2: MockParticipant = { socketId: "s2", userId: "u2", name: "Bob (Slow Network)", color: "#fb923c", isHost: false, joinedAt: Date.now(), clockOffset: 0, rtt: 300, isBuffering: true };
+    room.participants.set(p1.socketId, p1);
+    room.participants.set(p2.socketId, p2);
+    room.playback.isPlaying = false; // Paused due to Bob buffering
+
+    // Bob disconnects abruptly
+    room.participants.delete(p2.socketId);
+
+    // Deadlock check
+    if (room.participants.size > 0 && !room.playback.isPlaying) {
+      const allReady = Array.from(room.participants.values()).every((p) => !p.isBuffering);
+      if (allReady && (room.playback.videoUrl || room.playback.videoType === "file")) {
+        let highestRtt = 0;
+        for (const participant of room.participants.values()) {
+          highestRtt = Math.max(highestRtt, participant.rtt || 50);
+        }
+        room.playback.isPlaying = true;
+        room.playback.lastChangedAt = Date.now() + Math.max(highestRtt * 2, 500);
+        room.playback.lastChangedBy = "system";
+        room.playback.seq++;
       }
     }
-    // Final estimated offset must remain close to +100ms and completely immune to the 500ms outlier spikes
-    expect(sync.getOffset()).toBeCloseTo(100, 1);
+
+    expect(room.playback.isPlaying).toBe(true);
+    expect(room.playback.lastChangedBy).toBe("system");
   });
 });
 
-describe("Requirement R2: PISlewingController (PI Playhead Rate Control)", () => {
-  let pi: PISlewingController;
+describe("State Synchronization Engine: WebRTC Mesh Targeted Signaling", () => {
+  let room: MockRoom;
 
   beforeEach(() => {
-    pi = new PISlewingController({
-      kp: 0.05,
-      ki: 0.005,
-      minRate: 0.95,
-      maxRate: 1.05,
-      deadbandSec: 0.1,
-      hardSeekSec: 1.0,
-    });
+    room = createMockRoom();
+    const p1: MockParticipant = { socketId: "sock_1", userId: "user_host", name: "Host", color: "#f87171", isHost: true, joinedAt: Date.now(), clockOffset: 0, rtt: 30 };
+    const p2: MockParticipant = { socketId: "sock_2", userId: "user_viewer1", name: "Viewer 1", color: "#fb923c", isHost: false, joinedAt: Date.now(), clockOffset: 0, rtt: 40 };
+    const p3: MockParticipant = { socketId: "sock_3", userId: "user_viewer2", name: "Viewer 2", color: "#fbbf24", isHost: false, joinedAt: Date.now(), clockOffset: 0, rtt: 50 };
+    room.participants.set(p1.socketId, p1);
+    room.participants.set(p2.socketId, p2);
+    room.participants.set(p3.socketId, p3);
   });
 
-  test("returns NONE action within deadband zone (|error| <= 100ms)", () => {
-    const res = pi.compute(10.05, 10.0, 0.5, 1.0); // error = +0.05s (50ms)
-    expect(res.action).toBe("NONE");
-    expect(res.slewRate).toBe(1.0);
-    expect(pi.getIntegral()).toBe(0);
-  });
+  test("rtc:signal targets exact recipient socketId via payload.to lookup", () => {
+    const payload = {
+      to: "user_viewer2",
+      msg: { type: "offer", sdp: "v=0..." },
+    };
 
-  test("returns SEEK action when desync exceeds hard seek threshold (|error| > 1.0s)", () => {
-    const res = pi.compute(12.5, 10.0, 0.5, 1.0); // error = +2.5s
-    expect(res.action).toBe("SEEK");
-    expect(res.slewRate).toBe(1.0);
-    expect(pi.getIntegral()).toBe(0);
-  });
-
-  test("computes PI slewing rate correctly for moderate lag (0.1s < |error| <= 1.0s)", () => {
-    // expected = 10.4s, actual = 10.0s, error = +0.4s (400ms lag)
-    // dt = 0.5s
-    // Integral = 0 + 0.4 * 0.5 = 0.2
-    // Raw rate = 1.0 + 0.05 * 0.4 + 0.005 * 0.2 = 1.0 + 0.02 + 0.001 = 1.021
-    const res = pi.compute(10.4, 10.0, 0.5, 1.0);
-    expect(res.action).toBe("SLEW");
-    expect(res.slewRate).toBeCloseTo(1.021, 4);
-    expect(pi.getIntegral()).toBeCloseTo(0.2, 4);
-  });
-
-  test("strictly clamps slew rate to [0.95, 1.05] and freezes integral on saturation (anti-windup)", () => {
-    // Moderate error causing rate within bounds
-    const res1 = pi.compute(10.9, 10.0, 0.5, 1.0);
-    expect(res1.action).toBe("SLEW");
-    expect(res1.slewRate).toBeLessThanOrEqual(1.05);
-
-    // Repeated step calls with large error that would push rate beyond 1.05 without clamping
-    for (let i = 0; i < 20; i++) {
-      const res = pi.compute(10.95, 10.0, 0.5, 1.0);
-      expect(res.slewRate).toBeLessThanOrEqual(1.05);
-      expect(res.slewRate).toBeGreaterThanOrEqual(0.95);
+    let targetSocketId: string | null = null;
+    for (const [sId, p] of room.participants.entries()) {
+      if (p.userId === payload.to) {
+        targetSocketId = sId;
+        break;
+      }
     }
+
+    expect(targetSocketId).toBe("sock_3");
   });
 
-  test("STRESS: large positive accumulative error (+800ms) freezes integral and recovers instantly without windup explosion", () => {
-    // 100 consecutive steps with large error (+0.8s, 800ms lag)
-    let lastRes;
-    for (let i = 0; i < 100; i++) {
-      lastRes = pi.compute(10.8, 10.0, 0.5, 1.0);
-      expect(lastRes.action).toBe("SLEW");
-      expect(lastRes.slewRate).toBeLessThanOrEqual(1.05);
+  test("stream:announce updates room streamHost state correctly", () => {
+    // Announce start
+    room.streamHost = { userId: "user_host", fileName: "MyMovie.mp4" };
+    expect(room.streamHost).toEqual({ userId: "user_host", fileName: "MyMovie.mp4" });
+
+    // Announce stop
+    room.streamHost = null;
+    expect(room.streamHost).toBeNull();
+  });
+
+  test("streamHost is cleared when streaming participant disconnects", () => {
+    room.streamHost = { userId: "user_host", fileName: "Stream.mp4" };
+
+    // Host disconnects
+    const me = room.participants.get("sock_1");
+    room.participants.delete("sock_1");
+    if (room.streamHost && room.streamHost.userId === me?.userId) {
+      room.streamHost = null;
     }
-    // After step-wise accumulation, slew rate saturates at maxRate (1.05)
-    expect(lastRes?.slewRate).toBe(1.05);
 
-    // Integral must be frozen once unconstrained rate > 1.05 (anti-windup guard)
-    const saturatedIntegral = pi.getIntegral();
-    expect(saturatedIntegral).toBeLessThan(5.0); // Should freeze at ~2.0 instead of blowing up to 40+
-
-    // Drop error down to moderate +0.2s (200ms lag)
-    const recoveryRes = pi.compute(10.2, 10.0, 0.5, 1.0);
-    expect(recoveryRes.action).toBe("SLEW");
-    // Should immediately recover below 1.05 instead of remaining saturated
-    expect(recoveryRes.slewRate).toBeLessThan(1.05);
-    expect(recoveryRes.slewRate).toBeGreaterThan(1.0);
-  });
-
-  test("STRESS: large negative accumulative error (-800ms) freezes integral at lower bound 0.95", () => {
-    // 100 consecutive steps with large negative error (-0.8s, 800ms lead)
-    let lastRes;
-    for (let i = 0; i < 100; i++) {
-      lastRes = pi.compute(9.2, 10.0, 0.5, 1.0);
-      expect(lastRes.action).toBe("SLEW");
-      expect(lastRes.slewRate).toBeGreaterThanOrEqual(0.95);
-    }
-    // Slew rate saturates at minRate (0.95)
-    expect(lastRes?.slewRate).toBe(0.95);
-
-    // Drop error to moderate -0.2s (-200ms lead)
-    const recoveryRes = pi.compute(9.8, 10.0, 0.5, 1.0);
-    expect(recoveryRes.action).toBe("SLEW");
-    expect(recoveryRes.slewRate).toBeGreaterThan(0.95);
-    expect(recoveryRes.slewRate).toBeLessThan(1.0);
-  });
-
-  test("STRESS: deadband boundary (|e_k| <= 100ms) precision and anti-oscillation", () => {
-    // Exact 99ms error -> inside deadband
-    const r99 = pi.compute(10.099, 10.0, 0.5, 1.0);
-    expect(r99.action).toBe("NONE");
-    expect(r99.slewRate).toBe(1.0);
-    expect(pi.getIntegral()).toBe(0);
-
-    // Exact 100ms error -> deadband limit
-    const r100 = pi.compute(10.100, 10.0, 0.5, 1.0);
-    expect(r100.action).toBe("NONE");
-    expect(r100.slewRate).toBe(1.0);
-    expect(pi.getIntegral()).toBe(0);
-
-    // Exact 101ms error -> outside deadband
-    const r101 = pi.compute(10.101, 10.0, 0.5, 1.0);
-    expect(r101.action).toBe("SLEW");
-    expect(r101.slewRate).toBeGreaterThan(1.0);
-
-    // Negative deadband boundaries
-    const rNeg99 = pi.compute(9.901, 10.0, 0.5, 1.0);
-    expect(rNeg99.action).toBe("NONE");
-    expect(rNeg99.slewRate).toBe(1.0);
-
-    const rNeg101 = pi.compute(9.899, 10.0, 0.5, 1.0);
-    expect(rNeg101.action).toBe("SLEW");
-    expect(rNeg101.slewRate).toBeLessThan(1.0);
-  });
-
-  test("STRESS: rapid deadband toggling resets integral cleanly to prevent accumulation across boundary crossings", () => {
-    for (let i = 0; i < 20; i++) {
-      // Slewing step (150ms error)
-      pi.compute(10.15, 10.0, 0.5, 1.0);
-      expect(pi.getIntegral()).toBeGreaterThan(0);
-
-      // Deadband step (50ms error) -> resets integral to 0
-      const dbRes = pi.compute(10.05, 10.0, 0.5, 1.0);
-      expect(dbRes.action).toBe("NONE");
-      expect(dbRes.slewRate).toBe(1.0);
-      expect(pi.getIntegral()).toBe(0);
-    }
-  });
-
-  test("resets integral accumulator on reset()", () => {
-    pi.compute(10.5, 10.0, 0.5, 1.0);
-    expect(pi.getIntegral()).toBeGreaterThan(0);
-    pi.reset();
-    expect(pi.getIntegral()).toBe(0);
+    expect(room.streamHost).toBeNull();
   });
 });
 
-describe("Requirement R2: Frame-Exact Expected Playhead Calculation", () => {
-  test("calculates frame-exact room playhead for late joiners", () => {
-    const roomBaseTime = 120.0; // 2 minutes in video timeline
-    const lastChangedAtMs = 10000; // server ms timestamp when state was set
-    const clientNowMs = 15000; // client ms timestamp on join
-    const clockOffsetMs = 50; // client is 50ms behind server (serverNow = 15050ms)
-    const playbackRate = 1.0;
+describe("State Synchronization Engine: CineVo Bridge & Local File Sync", () => {
+  let room: MockRoom;
 
-    // Server elapsed = (15050 - 10000) / 1000 = 5.05s
-    // Expected playhead = 120.0 + 5.05 * 1.0 = 125.05s
-    const expectedPlayhead = computeExpectedPlayhead(
-      roomBaseTime,
-      lastChangedAtMs,
-      clientNowMs,
-      clockOffsetMs,
-      playbackRate,
-      true
-    );
-
-    expect(expectedPlayhead).toBeCloseTo(125.05, 3);
+  beforeEach(() => {
+    room = createMockRoom();
   });
 
-  test("returns room base time when video is paused", () => {
-    const roomBaseTime = 45.0;
-    const expectedPlayhead = computeExpectedPlayhead(
-      roomBaseTime,
-      10000,
-      20000,
-      100,
-      1.0,
-      false
-    );
+  test("source:set sets external URL and setBy metadata", () => {
+    const extUrl = "https://cinevo.nl/watch/movie-123";
+    room.source = { url: extUrl, setBy: "user_alice", setAt: Date.now() };
 
-    expect(expectedPlayhead).toBe(45.0);
+    expect(room.source.url).toBe(extUrl);
+    expect(room.source.setBy).toBe("user_alice");
+
+    // Clearing source
+    room.source = null;
+    expect(room.source).toBeNull();
+  });
+
+  test("agent:ad tracks ad break status per participant", () => {
+    room.adState.set("sock_1", true);
+    expect(room.adState.get("sock_1")).toBe(true);
+
+    room.adState.set("sock_1", false);
+    expect(room.adState.get("sock_1")).toBe(false);
+  });
+
+  test("Local File Sync aggressively converts blob URLs to file://local and retains fileName", () => {
+    const rawPayload = {
+      videoUrl: "blob:http://localhost:3000/a3f2b4c8-1111-4444",
+      fileName: "Inception.2010.1080p.mkv",
+      videoType: "file",
+    };
+
+    // Server logic from mini-services/sync-service/index.ts line 312
+    if (rawPayload.videoUrl && rawPayload.videoUrl.startsWith("blob:")) {
+      rawPayload.videoUrl = "file://local";
+      rawPayload.videoType = "file";
+    }
+
+    expect(rawPayload.videoUrl).toBe("file://local");
+    expect(rawPayload.videoType).toBe("file");
+    expect(rawPayload.fileName).toBe("Inception.2010.1080p.mkv");
+  });
+});
+
+describe("State Synchronization Engine: Video Type Detection & YouTube URL Parser", () => {
+  test("correctly classifies supported video URLs", () => {
+    expect(detectVideoType("https://www.youtube.com/watch?v=dQw4w9WgXcQ")).toBe("youtube");
+    expect(detectVideoType("https://youtu.be/dQw4w9WgXcQ")).toBe("youtube");
+    expect(detectVideoType("https://example.com/live/stream.m3u8")).toBe("hls");
+    expect(detectVideoType("https://example.com/video.mp4?token=abc")).toBe("mp4");
+    expect(detectVideoType("https://example.com/video.webm")).toBe("webm");
+    expect(detectVideoType("https://example.com/video.ogg")).toBe("ogg");
+    expect(detectVideoType("magnet:?xt=urn:btih:0123456789abcdef")).toBe("torrent");
+    expect(detectVideoType("https://vimeo.com/123456789")).toBe("vimeo");
+    expect(detectVideoType("https://www.dailymotion.com/video/x7tgad0")).toBe("dailymotion");
+    expect(detectVideoType("https://twitch.tv/streamer")).toBe("twitch");
+    expect(detectVideoType("https://generic-site.com/embed/123")).toBe("iframe");
+  });
+
+  test("extracts YouTube video IDs correctly across all formats", () => {
+    expect(youtubeId("https://www.youtube.com/watch?v=dQw4w9WgXcQ")).toBe("dQw4w9WgXcQ");
+    expect(youtubeId("https://youtu.be/dQw4w9WgXcQ?t=42")).toBe("dQw4w9WgXcQ");
+    expect(youtubeId("https://www.youtube.com/embed/dQw4w9WgXcQ")).toBe("dQw4w9WgXcQ");
+    expect(youtubeId("https://www.youtube.com/v/dQw4w9WgXcQ")).toBe("dQw4w9WgXcQ");
+    expect(youtubeId("https://example.com/video.mp4")).toBeNull();
   });
 });

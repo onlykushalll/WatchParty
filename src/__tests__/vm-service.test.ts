@@ -1,6 +1,6 @@
 // @ts-ignore
 import { describe, expect, test, beforeEach } from "bun:test";
-import { FloorControlManager, normalizeCoordinates, sanitizeUrl } from "../../vm-service/index";
+import { FloorControlManager, normalizeCoordinates, sanitizeUrl, sanitizeUnit } from "../../vm-service/index";
 
 describe("Requirement R3: FloorControlManager State Machine & Single-Writer Security", () => {
   let floorManager: FloorControlManager;
@@ -189,6 +189,98 @@ describe("Requirement R3: FloorControlManager State Machine & Single-Writer Secu
   });
 });
 
+describe("Requirement R3: Binary Opcode Protocol Validation & Framing", () => {
+  test("Opcode 1 (0x01): JPEG Screencast Binary Frame Encoding & Decoding", () => {
+    const fakeJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+    const frameMsg = Buffer.concat([Buffer.from([0x01]), fakeJpeg]);
+
+    expect(frameMsg[0]).toBe(0x01);
+    const decodedJpeg = frameMsg.subarray(1);
+    expect(decodedJpeg).toEqual(fakeJpeg);
+  });
+
+  test("Opcode 12 (0x0C): CDP Frame Navigated Push Binary Encoding & Decoding", () => {
+    const targetUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+    const urlBuf = Buffer.from(targetUrl, "utf-8");
+    const len = urlBuf.length;
+    const navFrame = Buffer.concat([
+      Buffer.from([12, (len >> 8) & 0xff, len & 0xff]),
+      urlBuf,
+    ]);
+
+    expect(navFrame[0]).toBe(12);
+    const decodedLen = (navFrame[1] << 8) | navFrame[2];
+    expect(decodedLen).toBe(len);
+    const decodedUrl = new TextDecoder().decode(navFrame.subarray(3, 3 + decodedLen));
+    expect(decodedUrl).toBe(targetUrl);
+  });
+
+  test("Opcode 16 (0x10): Request Floor Control Binary Encoding & Decoding", () => {
+    const userId = "usr_super_123";
+    const userBytes = new TextEncoder().encode(userId);
+    const msg = new Uint8Array(2 + userBytes.length);
+    msg[0] = 0x10;
+    msg[1] = userBytes.length & 0xff;
+    msg.set(userBytes, 2);
+
+    expect(msg[0]).toBe(0x10);
+    const len = msg[1];
+    expect(len).toBe(userBytes.length);
+    const parsedUserId = new TextDecoder().decode(msg.subarray(2, 2 + len));
+    expect(parsedUserId).toBe(userId);
+  });
+
+  test("Opcode 17 (0x11): Release Floor Control Binary Encoding & Decoding", () => {
+    const userId = "usr_super_123";
+    const userBytes = new TextEncoder().encode(userId);
+    const msg = new Uint8Array(2 + userBytes.length);
+    msg[0] = 0x11;
+    msg[1] = userBytes.length & 0xff;
+    msg.set(userBytes, 2);
+
+    expect(msg[0]).toBe(0x11);
+    const len = msg[1];
+    const parsedUserId = new TextDecoder().decode(msg.subarray(2, 2 + len));
+    expect(parsedUserId).toBe(userId);
+  });
+
+  test("Opcode 18 (0x12): Floor Status Broadcast Binary Encoding & Decoding", () => {
+    const controllerId = "user_host_1";
+    const idBytes = new TextEncoder().encode(controllerId);
+    const msg = new Uint8Array(3 + idBytes.length);
+    msg[0] = 0x12;
+    msg[1] = 1; // State: 1 = OCCUPIED
+    msg[2] = idBytes.length & 0xff;
+    msg.set(idBytes, 3);
+
+    expect(msg[0]).toBe(0x12);
+    expect(msg[1]).toBe(1);
+    const len = msg[2];
+    const activeId = new TextDecoder().decode(msg.subarray(3, 3 + len));
+    expect(activeId).toBe(controllerId);
+  });
+
+  test("Opcode 128 (0x80) & Opcode 129 (0x81): JSON Payload Encoding & Decoding", () => {
+    const grantPayload = { controllerId: "user_alice", controllerName: "Alice" };
+    const grantMsg = Buffer.concat([
+      Buffer.from([128]),
+      Buffer.from(JSON.stringify(grantPayload)),
+    ]);
+    expect(grantMsg[0]).toBe(128);
+    const decodedGrant = JSON.parse(new TextDecoder().decode(grantMsg.subarray(1)));
+    expect(decodedGrant).toEqual(grantPayload);
+
+    const statePayload = { controllerId: "user_alice", controllerName: "Alice", queue: [] };
+    const stateMsg = Buffer.concat([
+      Buffer.from([129]),
+      Buffer.from(JSON.stringify(statePayload)),
+    ]);
+    expect(stateMsg[0]).toBe(129);
+    const decodedState = JSON.parse(new TextDecoder().decode(stateMsg.subarray(1)));
+    expect(decodedState).toEqual(statePayload);
+  });
+});
+
 describe("Requirement R3: Remote Input Unit Vector Coordinate Normalization Math", () => {
   test("maps center coordinate (0.5, 0.5) to exact center pixels (960, 540) on 1920x1080", () => {
     const coords = normalizeCoordinates(0.5, 0.5, 1920, 1080);
@@ -218,7 +310,7 @@ describe("Requirement R3: Remote Input Unit Vector Coordinate Normalization Math
     expect(coords.y).toBe(1079);
   });
 
-  test("handles arbitrary viewport dimensions (e.g. 1600x900)", () => {
+  test("handles arbitrary viewport dimensions (e.g. 1600x900, 1280x720)", () => {
     const center = normalizeCoordinates(0.5, 0.5, 1600, 900);
     expect(center.x).toBe(800);
     expect(center.y).toBe(450);
@@ -226,10 +318,14 @@ describe("Requirement R3: Remote Input Unit Vector Coordinate Normalization Math
     const max = normalizeCoordinates(1.0, 1.0, 1600, 900);
     expect(max.x).toBe(1599);
     expect(max.y).toBe(899);
+
+    const center720 = normalizeCoordinates(0.5, 0.5, 1280, 720);
+    expect(center720.x).toBe(640);
+    expect(center720.y).toBe(360);
   });
 });
 
-describe("Requirement R3: Address Bar Navigation URL Sanitization", () => {
+describe("Requirement R3: Address Bar Navigation URL Sanitization & SSRF Protection", () => {
   test("preserves valid http:// and https:// URLs", () => {
     expect(sanitizeUrl("http://example.com")).toBe("http://example.com/");
     expect(sanitizeUrl("https://www.google.com/search?q=test")).toBe("https://www.google.com/search?q=test");
@@ -405,7 +501,6 @@ describe("Milestone 3 EMPIRICAL STRESS TESTS: FloorControlManager Mutex & Coordi
 
     // NaN input values
     const nanCoords = normalizeCoordinates(NaN, NaN, 1920, 1080);
-    // Empirical test to check if NaN is strictly clamped to [0, 1]^2 bounds (0) or if it returns NaN
     expect(Number.isNaN(nanCoords.x)).toBe(false);
     expect(Number.isNaN(nanCoords.y)).toBe(false);
     expect(nanCoords.x).toBeGreaterThanOrEqual(0);
@@ -414,4 +509,3 @@ describe("Milestone 3 EMPIRICAL STRESS TESTS: FloorControlManager Mutex & Coordi
     expect(nanCoords.y).toBeLessThan(1080);
   });
 });
-
