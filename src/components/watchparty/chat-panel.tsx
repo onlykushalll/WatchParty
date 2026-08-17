@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChatMessage } from "@/lib/sync/types";
-import { Send, Users, CheckCheck, Smile, ShieldAlert } from "lucide-react";
-import { toast } from "sonner";
+import { Send, Users, CheckCheck, Smile } from "lucide-react";
 
 interface ChatPanelProps {
   messages: ChatMessage[];
@@ -31,19 +30,18 @@ export function ChatPanel({
   const [text, setText] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isAtBottom, setIsAtBottom] = useState(true);
-  const lastProcessedSystemId = useRef<string | null>(null);
 
-  // Trigger Sonner Toast notifications on new system events
-  useEffect(() => {
-    if (messages.length === 0) return;
-    const lastMsg = messages[messages.length - 1];
-    if (lastMsg.userId === "system" && lastMsg.id !== lastProcessedSystemId.current) {
-      lastProcessedSystemId.current = lastMsg.id;
-      toast.info(lastMsg.text, {
-        icon: <ShieldAlert className="h-4 w-4 text-[#00a884]" />,
-        duration: 3000,
-      });
-    }
+  // Filter out noisy system spam (e.g. buffering, left, ready) to keep conversation clean
+  const cleanMessages = useMemo(() => {
+    return messages.filter((m) => {
+      if (m.userId === "system") {
+        const t = (m.text || "").toLowerCase();
+        if (t.includes("buffering") || t.includes("left") || t.includes("ready") || t.includes("resuming")) {
+          return false;
+        }
+      }
+      return true;
+    });
   }, [messages]);
 
   // Auto-scroll to bottom when new messages arrive (only if user is at bottom)
@@ -54,7 +52,7 @@ export function ChatPanel({
     if (el && isAtBottom) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages, isAtBottom]);
+  }, [cleanMessages, isAtBottom]);
 
   const handleScroll = () => {
     const el = scrollRef.current?.querySelector(
@@ -121,7 +119,7 @@ export function ChatPanel({
           onScroll={handleScroll}
         >
           <div className="flex flex-col gap-1.5 py-3">
-            {messages.length === 0 && (
+            {cleanMessages.length === 0 && (
               <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
                 <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#111b21] border border-[#222d34]">
                   <Send className="h-5 w-5 text-[#00a884]" />
@@ -135,10 +133,10 @@ export function ChatPanel({
               </div>
             )}
 
-            {messages.map((m, i) => {
+            {cleanMessages.map((m, i) => {
               const isSystem = m.userId === "system";
               const isMe = m.userId === youId;
-              const prevMsg = messages[i - 1];
+              const prevMsg = cleanMessages[i - 1];
               const showAvatar =
                 !isSystem && (!prevMsg || prevMsg.userId !== m.userId);
 
@@ -178,26 +176,23 @@ export function ChatPanel({
                     }`}
                   >
                     {showAvatar && !isMe && (
-                      <span
-                        className="mb-0.5 px-1 text-[10px] font-semibold"
-                        style={{ color: m.color }}
-                      >
+                      <span className="mb-0.5 text-[10px] font-semibold text-[#00a884]">
                         {m.userName}
                       </span>
                     )}
-
                     <div
-                      className={`relative px-3 py-1.5 text-xs shadow-md ${
+                      className={`relative rounded-xl px-3 py-1.5 shadow-sm text-xs leading-relaxed break-words max-w-full ${
                         isMe
-                          ? "rounded-2xl rounded-tr-none bg-[#005c4b] text-[#e9edef]"
-                          : "rounded-2xl rounded-tl-none bg-[#202c33] text-[#e9edef]"
+                          ? "rounded-tr-none bg-[#005c4b] text-[#e9edef]"
+                          : "rounded-tl-none bg-[#202c33] text-[#e9edef]"
                       }`}
                     >
-                      <p className="break-words leading-relaxed whitespace-pre-wrap">
-                        {m.text}
-                      </p>
-
-                      <div className="mt-1 flex items-center justify-end gap-1 text-[9px] text-[#8696a0]">
+                      <span>{m.text}</span>
+                      <div
+                        className={`flex items-center gap-1 mt-0.5 justify-end text-[9px] ${
+                          isMe ? "text-[#8696a0]" : "text-[#8696a0]"
+                        }`}
+                      >
                         <span>{fmtTime(m.at)}</span>
                         {isMe && (
                           <CheckCheck className="h-3 w-3 text-[#53bdeb]" />
@@ -213,38 +208,36 @@ export function ChatPanel({
       </div>
 
       {/* Quick Emoji Bar */}
-      <div className="flex items-center gap-1 border-t border-[#222d34] bg-[#111b21] px-2 py-1 overflow-x-auto no-scrollbar">
+      <div className="flex items-center justify-around border-t border-[#222d34] bg-[#1f2c34] px-2 py-1.5 text-sm">
         {["👍", "❤️", "😂", "😮", "🎉", "🔥", "👏"].map((emoji) => (
           <button
             key={emoji}
-            type="button"
             onClick={() => quickEmoji(emoji)}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs hover:bg-[#202c33] transition-colors"
+            className="rounded-full p-1 hover:bg-[#2a3942] transition-colors active:scale-125"
           >
             {emoji}
           </button>
         ))}
       </div>
 
-      {/* WhatsApp Input Bar */}
+      {/* WhatsApp Message Input Bar */}
       <form
         onSubmit={submit}
-        className="flex items-center gap-2 border-t border-[#222d34] bg-[#202c33] p-2"
+        className="flex items-center gap-2 border-t border-[#222d34] bg-[#1f2c34] p-2"
       >
         <div className="relative flex-1">
           <Input
             value={text}
             onChange={(e) => setText(e.target.value)}
             placeholder="Type a message…"
-            maxLength={1000}
-            className="h-9 rounded-lg border-0 bg-[#2a3942] pl-3 pr-8 text-xs text-[#e9edef] placeholder-[#8696a0] focus-visible:ring-1 focus-visible:ring-[#00a884]"
+            className="h-9 rounded-lg bg-[#2a3942] border-0 text-[#e9edef] placeholder:text-[#8696a0] pr-8 text-xs focus-visible:ring-1 focus-visible:ring-[#00a884]"
           />
-          <Smile className="absolute right-2.5 top-2.5 h-4 w-4 text-[#8696a0]" />
+          <Smile className="absolute right-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-[#8696a0] pointer-events-none" />
         </div>
         <Button
           type="submit"
           size="icon"
-          className="h-9 w-9 shrink-0 rounded-full bg-[#00a884] text-white hover:bg-[#008f6f] shadow-md disabled:opacity-50"
+          className="h-9 w-9 shrink-0 rounded-full bg-[#00a884] text-white hover:bg-[#00a884]/90 shadow-md transition-all active:scale-95"
           disabled={!text.trim()}
         >
           <Send className="h-4 w-4" />

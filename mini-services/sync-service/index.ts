@@ -447,10 +447,6 @@ io.on("connection", (socket: Socket) => {
       p.lastChangedBy = me.userId;
       p.seq++;
       broadcastPlayback(io, r);
-      io.to(currentRoomId).emit("chat:system", {
-        text: `${me.name} is buffering…`,
-        at: Date.now(),
-      });
     } else {
       const allReady = Array.from(r.participants.values()).every((p) => !p.isBuffering);
       if (allReady && (r.playback.videoUrl || r.playback.videoType === "file")) {
@@ -464,10 +460,6 @@ io.on("connection", (socket: Socket) => {
         p.lastChangedBy = me.userId;
         p.seq++;
         broadcastPlayback(io, r);
-        io.to(currentRoomId).emit("chat:system", {
-          text: `Everyone ready — resuming`,
-          at: Date.now(),
-        });
       }
     }
   });
@@ -819,10 +811,6 @@ io.on("connection", (socket: Socket) => {
           p.lastChangedBy = "system";
           p.seq++;
           broadcastPlayback(io, r);
-          io.to(currentRoomId).emit("chat:system", {
-            text: `Buffering participant left — resuming playback`,
-            at: Date.now(),
-          });
         }
       }
     }

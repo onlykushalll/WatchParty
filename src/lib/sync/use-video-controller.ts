@@ -263,17 +263,21 @@ export function useVideoController({
         guardRef.current = true;
         v.currentTime = expectedSec;
         v.playbackRate = desiredRate;
+        piControllerRef.current.reset();
         queueMicrotask(() => {
           guardRef.current = false;
         });
       } else if (output.action === "SLEW") {
-        if (Math.abs(v.playbackRate - output.slewRate) > 0.001) {
+        // Only adjust playbackRate if delta >= 0.015 to eliminate micro-jitter and audio stutter
+        if (Math.abs(v.playbackRate - output.slewRate) >= 0.015) {
           v.playbackRate = output.slewRate;
           (v as any).preservesPitch = true;
+          (v as any).mozPreservesPitch = true;
+          (v as any).webkitPreservesPitch = true;
         }
       } else {
         // action === "NONE" (within deadband <= 100ms)
-        if (Math.abs(v.playbackRate - desiredRate) > 0.001) {
+        if (Math.abs(v.playbackRate - desiredRate) >= 0.01) {
           v.playbackRate = desiredRate;
         }
       }
