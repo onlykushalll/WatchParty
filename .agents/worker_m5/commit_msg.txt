@@ -1,9 +1,0 @@
-feat(core): complete system hardening, player stage UI, light theme default, and adversarial test suite
-
-- Hardened Cristian's algorithm clock sync with EMA smoothing and RTT filtering
-- 3-tier PI rate slewing controller with anti-windup accumulator bounds
-- Buffer-aware group wait and WebRTC targeted signaling relays
-- VM Co-browsing mutex floor control state machine and coordinate normalization
-- UI components: UniversalPlayer, VirtualBrowser, WhatsApp styled ChatPanel, QueuePanel, and privacy CallsPanel
-- Porcelain light theme default styling
-- Comprehensive adversarial test suite with 120 passing tests and 0-error production build

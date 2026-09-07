@@ -65,3 +65,14 @@ server.log
 /tool-results/
 /download/
 /upload/
+
+
+# AI & Session residue
+.agents/
+.claude/
+.codex/
+*.handoff.md
+CLAUDE.md
+AGENTS.md
+ORIGINAL_REQUEST.md
+commit-msg.txt

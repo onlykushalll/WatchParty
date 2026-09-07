@@ -1,1 +1,0 @@
-WatchParty: production watch-together platform with real-time sync, universal video player, virtual browser, chat, reactions, and queue
