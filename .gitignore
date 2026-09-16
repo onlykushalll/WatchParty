@@ -14,10 +14,14 @@ node_modules
 # production
 /build
 
-# database
+# database & storage
 *.db
 *.db-journal
+*.sqlite
+*.sqlite3
 /db/
+/prisma/db/
+*.zip
 
 # misc
 .DS_Store

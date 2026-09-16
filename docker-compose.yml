@@ -12,12 +12,12 @@ services:
       - PORT=3000
       - CORS_ORIGIN=*
       - PUBLIC_URL=http://localhost:3000
-      - DATABASE_URL=file:./db/watchparty.db
+      - DATABASE_URL=file:./data/app.db
       - NEXT_PUBLIC_SYNC_SERVICE_URL=http://localhost:3003
       - NEXT_PUBLIC_VM_SERVICE_URL=ws://localhost:3004
       - NODE_ENV=production
     volumes:
-      - app_db:/app/db
+      - app_data:/app/data
     healthcheck:
       test: ["CMD-SHELL", "node -e 'require(\"http\").get(\"http://localhost:3000/\", (res) => process.exit(res.statusCode < 500 ? 0 : 1)).on(\"error\", () => process.exit(1))'"]
       interval: 10s
@@ -64,4 +64,4 @@ services:
       retries: 3
 
 volumes:
-  app_db:
+  app_data:

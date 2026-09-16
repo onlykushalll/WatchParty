@@ -1,16 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
+import { getIceServers } from "./ice-config";
 
 // ─── WebRTC config ──────────────────────────────────────────────────────────
-// Google's public STUN servers work for ~80% of NAT scenarios.
-// For symmetric NAT (some corporate/hotel networks), you'd need a TURN server.
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun2.l.google.com:19302" },
-  { urls: "stun:global.stun.twilio.com:3478" },
-];
+const ICE_SERVERS: RTCIceServer[] = getIceServers();
 
 export interface StreamPeer {
   userId: string;

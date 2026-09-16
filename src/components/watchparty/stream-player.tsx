@@ -21,6 +21,7 @@ import {
   ArrowRight,
 } from "lucide-react";
 import { useWebRTCStream } from "@/lib/webrtc/use-webrtc-stream";
+import { getIceServers } from "@/lib/webrtc/ice-config";
 import { PlaybackState } from "@/lib/sync/types";
 import { useVideoController } from "@/lib/sync/use-video-controller";
 
@@ -67,10 +68,7 @@ function loadWebTorrent(): Promise<any> {
     wtClient = new WT({
       tracker: {
         rtcConfig: {
-          iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            { urls: "stun:global.stun.twilio.com:3478" },
-          ],
+          iceServers: getIceServers(),
         },
       },
     });
@@ -88,10 +86,7 @@ function loadWebTorrent(): Promise<any> {
           wtClient = new WT({
             tracker: {
               rtcConfig: {
-                iceServers: [
-                  { urls: "stun:stun.l.google.com:19302" },
-                  { urls: "stun:global.stun.twilio.com:3478" },
-                ],
+                iceServers: getIceServers(),
               },
             },
           });
@@ -111,10 +106,7 @@ function loadWebTorrent(): Promise<any> {
         wtClient = new WT({
           tracker: {
             rtcConfig: {
-              iceServers: [
-                { urls: "stun:stun.l.google.com:19302" },
-                { urls: "stun:global.stun.twilio.com:3478" },
-              ],
+              iceServers: getIceServers(),
             },
           },
         });

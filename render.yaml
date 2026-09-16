@@ -18,7 +18,7 @@ services:
       - key: PUBLIC_URL
         sync: false
       - key: DATABASE_URL
-        value: file:./db/watchparty.db
+        value: file:./data/app.db
       - key: NEXT_PUBLIC_SYNC_SERVICE_URL
         sync: false
       - key: NEXT_PUBLIC_VM_SERVICE_URL

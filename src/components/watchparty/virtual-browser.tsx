@@ -20,7 +20,7 @@ import {
 
 interface VirtualBrowserProps {
   vmUrl: string;
-  password: string;
+  password?: string;
   userName: string;
   userColor: string;
   userId: string;

@@ -660,8 +660,7 @@ function RoomView({
               </div>
             ) : mode === "vm" ? (
               <VirtualBrowser
-                vmUrl={typeof window !== "undefined" ? (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? "http://localhost:3004" : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "vm"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//vm.${window.location.hostname}`; })()) : "https://vm.kushalneedsmcp.online"}
-                password="watchparty"
+                vmUrl={typeof window !== "undefined" ? (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" ? "http://localhost:3004" : (() => { const p = window.location.hostname.split("."); if (p.length >= 3) { p[0] = "vm"; return `${window.location.protocol}//${p.join(".")}`; } return `${window.location.protocol}//vm.${window.location.hostname}`; })()) : "http://localhost:3004"}
                 userName={userName}
                 userColor={engine.you?.color || "#a78bfa"}
                 userId={userId}

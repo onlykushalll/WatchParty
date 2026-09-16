@@ -42,7 +42,6 @@ WatchParty respects intellectual property rights. Users are solely responsible f
 
 ---
 
-## 5. Contact
+## 5. Contact & Support
 
-For inquiries regarding this Privacy Policy, please open an issue on our GitHub repository:
-https://github.com/onlykushalll/WatchParty
+For inquiries regarding this Privacy Policy, licensing, or compliance, please reach out through the official project distribution repository or contact the project maintainers directly.

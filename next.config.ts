@@ -5,11 +5,8 @@ const nextConfig: NextConfig = {
   reactStrictMode: false,
   // Allow the Cloudflare tunnel subdomain to access the dev server.
   allowedDevOrigins: [
-    "wp.kushalneedsmcp.online",
-    "https://wp.kushalneedsmcp.online",
-    "kushalneedsmcp.online",
-    "focus.kushalneedsmcp.online",
-    "examiner.kushalneedsmcp.online",
+    "localhost",
+    "127.0.0.1",
   ],
 };
 

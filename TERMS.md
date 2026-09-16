@@ -18,7 +18,7 @@ Please read these Terms of Service ("Terms") carefully before using WatchParty (
 
 WatchParty operates as an intermediary service provider under the Digital Millennium Copyright Act (17 U.S.C. § 512):
 - We do not host or store synchronized media content.
-- If you are a copyright owner and believe a room or link on our platform infringes your copyright, submit a formal notice to our designated agent via GitHub issues including:
+- If you are a copyright owner and believe a room or link on our platform infringes your copyright, submit a formal notice to our designated agent via the official support channel including:
   1. Identification of the copyrighted work claimed to be infringed.
   2. The specific URL or room identifier.
   3. Your contact information and a statement of good-faith belief.

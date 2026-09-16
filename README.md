@@ -99,7 +99,7 @@ WebRTC requires UDP, which Cloudflare Tunnel doesn't support. We use WebSocket f
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/onlykushalll/WatchParty.git
+git clone <repository-url>
 cd WatchParty
 npm install
 ```
@@ -108,7 +108,7 @@ npm install
 
 ```bash
 # Create .env with your database URL
-echo 'DATABASE_URL=file:./db/watchparty.db' > .env
+echo 'DATABASE_URL="file:./data/app.db"' > .env
 
 # Push schema + generate client
 npx prisma db push --accept-data-loss
@@ -254,9 +254,9 @@ WatchParty/
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `file:./db/watchparty.db` | SQLite database path |
-| `MCPILOT_BASE_URL` | `https://kushalneedsmcp.online` | MCPilot server (optional) |
-| `MCPILOT_TOKEN` | `mcpilot-secret-2024` | MCPilot auth token (optional) |
+| `DATABASE_URL` | `file:./data/app.db` | SQLite database path |
+| `MCPILOT_BASE_URL` | `http://localhost:3005` | MCPilot server (optional) |
+| `MCPILOT_TOKEN` | `""` | MCPilot auth token (optional) |
 
 ### Sync Engine Tuning
 
@@ -313,7 +313,7 @@ Clients send **intents** (`state:intent`), the server validates + timestamps + b
 
 ## 📝 License
 
-MIT License — see [LICENSE](LICENSE) file.
+Proprietary Commercial Source & Evaluation License — see [LICENSE.md](LICENSE.md). All Rights Reserved.
 
 ---
 

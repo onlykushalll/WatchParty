@@ -3,10 +3,9 @@
 // with the WatchParty room. Shows a floating "Sync" button when a video is found.
 
 (function() {
-  // Don't run on our own domain
-  if (window.location.hostname.includes('kushalneedsmcp.online') || 
-      window.location.hostname.includes('wp.') ||
-      window.location.hostname === 'localhost') return;
+  // Don't run on our own domain or local server
+  if (window.location.hostname === 'localhost' || 
+      window.location.hostname === '127.0.0.1') return;
 
   let sock = null;
   let video = null;

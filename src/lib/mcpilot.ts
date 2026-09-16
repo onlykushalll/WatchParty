@@ -9,9 +9,9 @@
  */
 
 export const MCPILOT_BASE_URL =
-  process.env.MCPILOT_BASE_URL || "https://kushalneedsmcp.online";
+  process.env.MCPILOT_BASE_URL || "http://localhost:3005";
 export const MCPILOT_TOKEN =
-  process.env.MCPILOT_TOKEN || "mcpilot-secret-2024";
+  process.env.MCPILOT_TOKEN || "";
 
 export interface McpilotRawResponse {
   ok: boolean;
