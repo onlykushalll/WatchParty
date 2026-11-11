@@ -55,37 +55,17 @@ A production-grade watch-party platform that lets you watch videos and browse th
 
 ## 🏗️ Architecture
 
-```
-┌──────────────────────────┐
-│  Next.js 16 App (3000)   │  ← Frontend + API routes
-│  - Landing + Room UI      │
-│  - Universal video player │
-│  - Virtual browser embed  │
-│  - /api/rooms (Prisma)    │
-│  - /api/proxy (iframe)    │
-└──────────┬───────────────┘
-           │ WebSocket (Socket.IO)
-           ▼
-┌──────────────────────────┐    ┌──────────────────────────┐
-│  Sync Service (3003)      │    │  VM Browser (3004)        │
-│  - Room state             │    │  - Puppeteer headless     │
-│  - Cristian clock sync    │    │    Chrome                 │
-│  - Server-authoritative   │    │  - Screenshot stream      │
-│    playback state         │    │  - Mouse/keyboard input   │
-│  - Chat, presence, queue  │    │  - WebSocket broadcast    │
-└──────────────────────────┘    └──────────────────────────┘
-           │                               │
-           └───────────┬───────────────────┘
-                       ▼
-              ┌────────────────┐
-              │  SQLite (Prisma) │
-              │  - Room          │
-              │  - ChatMessage   │
-              └────────────────┘
+```mermaid
+flowchart LR
+    Browser["Client Web App / Extension<br/>Next.js 16 + UniversalPlayer"] -->|"HTTP / Prisma API"| NextApp["Next.js App Server (:3000)<br/>Rooms API + Proxy + UI"]
+    Browser -->|"Socket.IO<br/>Cristian Clock Sync + Chat + Queue"| SyncSvc["Sync Service (:3003)<br/>Server-Authoritative State"]
+    Browser -->|"WebSocket / WebRTC<br/>Floor Control Mutex + Frames"| VMSvc["VM Browser Service (:3004)<br/>Headless Chrome + CDP Screencast"]
+    NextApp -->|"SQLite / Prisma"| DB[("Prisma DB<br/>Room & ChatMessage")]
+    SyncSvc -->|"Room State + Clock Offset"| DB
 ```
 
-### Why not WebRTC?
-WebRTC requires UDP, which Cloudflare Tunnel doesn't support. We use WebSocket for state sync (low-frequency, reliable) and MJPEG-over-WebSocket for the VM browser (works through any HTTP tunnel, ~12fps, ~80KB/frame).
+### Why WebSocket + MJPEG Fallback Alongside WebRTC?
+Strict NATs and HTTP tunnels restrict UDP peer connections. WatchParty pairs WebSocket server-authoritative sync (`≤100ms` drift via Cristian's algorithm + PI slewing) with CDP JPEG screencasting over WebSocket and P2P WebRTC voice/video + Screen/Torrent streaming.
 
 ---
 
@@ -104,11 +84,11 @@ cd WatchParty
 npm install
 ```
 
-### 2. Set up the database
+### 2. Set up environment & database
 
 ```bash
-# Create .env with your database URL
-echo 'DATABASE_URL="file:./data/app.db"' > .env
+# Copy environment template and configure values
+cp .env.example .env
 
 # Push schema + generate client
 npx prisma db push --accept-data-loss
@@ -180,8 +160,10 @@ The Next.js app can be deployed to any Node.js host. Set environment variables:
 
 ```env
 DATABASE_URL=<your-database-url>
-MCPILOT_BASE_URL=<optional>
-MCPILOT_TOKEN=<optional>
+NEXT_PUBLIC_SYNC_SERVICE_URL=http://localhost:3003
+NEXT_PUBLIC_VM_SERVICE_URL=ws://localhost:3004
+CHROME_PATH=/usr/bin/chromium
+CHROME_PROFILE_DIR=
 ```
 
 **Note:** The sync service (port 3003) and VM browser (port 3004) need to be deployed as separate services with their own WebSocket support.
@@ -212,8 +194,7 @@ WatchParty/
 │   ├── app/
 │   │   ├── api/
 │   │   │   ├── rooms/        # Room create/join API
-│   │   │   ├── proxy/        # iframe proxy (strips X-Frame-Options)
-│   │   │   └── mcpilot/      # MCPilot integration (optional)
+│   │   │   └── proxy/        # iframe proxy (strips X-Frame-Options)
 │   │   ├── globals.css       # Theme system (Porcelain + Obsidian)
 │   │   ├── layout.tsx        # Root layout
 │   │   └── page.tsx          # Landing + Room views
@@ -255,8 +236,14 @@ WatchParty/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `file:./data/app.db` | SQLite database path |
-| `MCPILOT_BASE_URL` | `http://localhost:3005` | MCPilot server (optional) |
-| `MCPILOT_TOKEN` | `""` | MCPilot auth token (optional) |
+| `PORT` | `3000` | Next.js web application port |
+| `CORS_ORIGIN` | `*` | Allowed CORS origins (`*` or comma-separated) |
+| `PUBLIC_URL` | `http://localhost:3000` | Public application base URL |
+| `NEXT_PUBLIC_SYNC_SERVICE_URL` | `http://localhost:3003` | Socket.IO sync service endpoint |
+| `NEXT_PUBLIC_VM_SERVICE_URL` | `ws://localhost:3004` | Virtual browser WebSocket endpoint |
+| `CHROME_PATH` | Platform default | Path to Chromium/Chrome executable |
+| `CHROME_PROFILE_DIR` | System temp `vm-chrome-profile` | Optional Chrome user-data directory |
+| `HEADLESS` | `true` | Run Chrome headless inside VM service |
 
 ### Sync Engine Tuning
 
@@ -311,9 +298,16 @@ Clients send **intents** (`state:intent`), the server validates + timestamps + b
 
 ---
 
-## 📝 License
+## 📝 Commercial Licensing & IP Acquisition
 
-Proprietary Commercial Source & Evaluation License — see [LICENSE.md](LICENSE.md). All Rights Reserved.
+Copyright (c) 2026 Kushal (@onlykushalll). All Rights Reserved.  
+Proprietary Commercial Evaluation Asset — see [LICENSE.md](LICENSE.md).
+
+Available for commercial licensing, technical due diligence, and full IP acquisition.  
+**Acquisition & Licensing Contact:** `creatormanager27@gmail.com` · GitHub: `https://github.com/onlykushalll`
+
+### Third-Party Open-Source Carve-Out
+Upstream frameworks and runtime libraries (Next.js, React, Socket.IO, Prisma, hls.js, noVNC, Puppeteer, Tailwind CSS, Radix UI) remain licensed under their respective open-source licenses. See [ARCHITECTURE.md](ARCHITECTURE.md) for subsystem engineering details.
 
 ---
 
