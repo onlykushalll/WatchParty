@@ -24,17 +24,24 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "http";
+import os from "os";
+import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 import { FloorControlManager, normalizeCoordinates, sanitizeUrl } from "./index";
 
-const PORT = 3004;
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const PORT = Number(process.env.CDP_PORT || 3004);
+const DEFAULT_CHROME_PATH =
+  process.platform === "win32"
+    ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    : "/usr/bin/chromium";
+const CHROME_PATH = process.env.CHROME_PATH || DEFAULT_CHROME_PATH;
 const WIDTH = 1280;
 const HEIGHT = 720;
 const FPS = 24;
 const JPEG_QUALITY = 75;
-const USER_DATA_DIR = "C:\\Users\\Default.L-HCG-9FVVGS3\\vm-chrome-profile";
+const USER_DATA_DIR =
+  process.env.CHROME_PROFILE_DIR || path.join(os.tmpdir(), "vm-chrome-profile");
 
 // ─── State ───
 let browser: Browser | null = null;

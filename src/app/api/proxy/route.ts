@@ -78,7 +78,7 @@ async function fetchFollowingRedirects(
  * This lets us embed pages in an <iframe> that would otherwise refuse to
  * be framed. NOTE: this is best-effort and will NOT bypass sites that
  * require login or use aggressive JS-based frame-busting. For those, the
- * "Remote PC" feature (MCPilot browser automation) is the right tool.
+ * Virtual Browser service (`vm-service`) is the right tool.
  */
 export async function GET(req: NextRequest) {
   const urlParam = req.nextUrl.searchParams.get("url");

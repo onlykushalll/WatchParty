@@ -13,12 +13,19 @@
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "http";
+import os from "os";
+import path from "path";
 import { WebSocketServer, WebSocket } from "ws";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 
-const PORT = 3005;
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-const USER_DATA_DIR = "C:\\Users\\Default.L-HCG-9FVVGS3\\vm-chrome-profile";
+const PORT = Number(process.env.EXTRACTOR_PORT || 3005);
+const DEFAULT_CHROME_PATH =
+  process.platform === "win32"
+    ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    : "/usr/bin/chromium";
+const CHROME_PATH = process.env.CHROME_PATH || DEFAULT_CHROME_PATH;
+const USER_DATA_DIR =
+  process.env.CHROME_PROFILE_DIR || path.join(os.tmpdir(), "vm-chrome-profile");
 
 let browser: Browser | null = null;
 let page: Page | null = null;

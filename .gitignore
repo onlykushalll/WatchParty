@@ -1,5 +1,5 @@
 # dependencies
-node_modules
+node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -8,11 +8,20 @@ node_modules
 /coverage
 
 # next.js
+.next/
 /.next/
+out/
 /out/
 
-# production
+# production / build artifacts
+build/
 /build
+dist/
+target/
+
+# python
+.venv/
+__pycache__/
 
 # database & storage
 *.db
@@ -34,6 +43,7 @@ yarn-error-log*
 
 # env files
 .env
+.env.local
 .env*.local
 
 # vercel
@@ -60,16 +70,12 @@ server.log
 # Cloudflare
 .cloudflared/
 
-# MCPilot (optional integration)
-/mcpilot-plugin.md
-
 # Research / scratch
 /research/
 /scripts/
 /tool-results/
 /download/
 /upload/
-
 
 # AI & Session residue
 .agents/

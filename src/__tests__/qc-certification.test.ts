@@ -12,7 +12,7 @@ describe("DataVendor QC Certification & Valuation Invariants", () => {
     expect(existsSync(licensePath)).toBe(true);
     const licenseContent = readFileSync(licensePath, "utf-8");
     expect(licenseContent).toContain("PROPRIETARY AND CONFIDENTIAL COMMERCIAL EVALUATION ASSET");
-    expect(licenseContent).toContain("Copyright (c) 2026 Kushal. All Rights Reserved.");
+    expect(licenseContent).toContain("Copyright (c) 2026 Kushal (@onlykushalll). All Rights Reserved.");
     expect(licenseContent).not.toContain("Permission is hereby granted, free of charge");
     expect(licenseContent).not.toContain("MIT License");
     expect(existsSync(join(rootDir, "LICENSE"))).toBe(false);
@@ -60,9 +60,17 @@ describe("DataVendor QC Certification & Valuation Invariants", () => {
   });
 
   test("Zero personal domain links or hardcoded dev secrets in codebase", () => {
-    const mcpilotContent = readFileSync(join(rootDir, "src/lib/mcpilot.ts"), "utf-8");
-    expect(mcpilotContent).not.toContain("kushalneedsmcp.online");
-    expect(mcpilotContent).not.toContain("mcpilot-secret-2024");
+    expect(existsSync(join(rootDir, "src/lib/mcpilot.ts"))).toBe(false);
+    expect(existsSync(join(rootDir, "src/lib/mcpilot-tools.ts"))).toBe(false);
+    expect(existsSync(join(rootDir, "src/app/api/mcpilot/route.ts"))).toBe(false);
+
+    const cdpContent = readFileSync(join(rootDir, "vm-service/cdp-browser.ts"), "utf-8");
+    expect(cdpContent).not.toContain("Default.L-HCG");
+    expect(cdpContent).not.toContain("C:\\\\Users\\\\");
+
+    const extractorContent = readFileSync(join(rootDir, "vm-service/video-extractor.ts"), "utf-8");
+    expect(extractorContent).not.toContain("Default.L-HCG");
+    expect(extractorContent).not.toContain("C:\\\\Users\\\\");
 
     const pageContent = readFileSync(join(rootDir, "src/app/page.tsx"), "utf-8");
     expect(pageContent).not.toContain("kushalneedsmcp.online");
